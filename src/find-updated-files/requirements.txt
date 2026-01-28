@@ -1,5 +1,5 @@
 # find-updated-files.py Requirements
-# 
+#
 # This script uses only Python standard library modules:
 # - os: OS-specific functionality
 # - time: Time/date handling
