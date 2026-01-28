@@ -9,7 +9,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 13:35
+Last Modified: 2026-01-28 13:45
 Fixed: Settings structure, scope handling, description defaults
 #>
 
@@ -50,7 +50,7 @@ $LastModifiedDate = "Unknown"
 
 # Extract Last Modified date from header
 try {
-    $headerContent = Get-Content $PSCommandPath -First 20 -ErrorAction SilentlyContinue
+    $headerContent = Get-Content $PSCommandPath -First 30 -ErrorAction SilentlyContinue
     $lastModifiedLine = $headerContent | Where-Object { $_ -match 'Last Modified:\s*(.+)' } | Select-Object -First 1
     if ($lastModifiedLine -and $Matches[1]) {
         $LastModifiedDate = $Matches[1].Trim()
