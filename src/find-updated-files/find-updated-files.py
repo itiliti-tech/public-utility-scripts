@@ -1,12 +1,45 @@
-#! /bin/python
+#!/usr/bin/env python3
+"""
+Find Updated Files Script
+
+Scans a directory tree for the most recently modified file in each subdirectory
+and outputs the results to a CSV file. This is useful for tracking which project
+folders have been updated since a specified date.
+
+Usage:
+    python find-updated-files.py
+
+    The script will prompt for:
+    - Root directory to scan
+    - Output CSV filename
+
+Output:
+    CSV file with columns: Folder Name, Last Modified, File
+
+Modified: auto-updated by pre-commit hook
+"""
+
 import os
 import time
 import unicodedata
 
-# Modified 5:07PM
-
 
 def searchFiles(rootDirectory, modifyDateLimit, excludedFiles):
+    """
+    Recursively search directories for the most recently modified file.
+
+    Scans the root directory and its subdirectories to find files modified
+    after the specified date. For each top-level folder, outputs the most
+    recently modified file and its modification date.
+
+    Args:
+        rootDirectory (str): The root directory to start searching from
+        modifyDateLimit (time.struct_time): The date threshold for modifications
+        excludedFiles (list): List of filenames to skip during the search
+
+    Returns:
+        None (outputs results to file and stdout)
+    """
     # iterate through all top level folders seperately
 
     for dir in os.listdir(rootDirectory):
@@ -22,46 +55,42 @@ def searchFiles(rootDirectory, modifyDateLimit, excludedFiles):
 
         # traverse all branches of the path using os.walk
         for root, dirs, files in os.walk(dirPath, topdown=True, followlinks=False):
-            # fileFound = False
-            # foundFilePath = ""
-            # foundFileModifiedDate = ""
-
+            # Search through all files in this directory level
             for name in files:
                 filePath = os.path.join(root, name)
 
+                # Verify the path points to a file
                 if not os.path.isfile(filePath):
                     continue
 
+                # Skip excluded files (system/temporary files)
                 if name in excludedFiles:
                     continue
 
                 # get the time the file was modified in seconds (float)
                 modifyTime = os.path.getmtime(filePath)
 
-                # convert modifyTime and modifyDate to time.struct_time object
-                # in order to compare them
-
+                # convert modifyTime to time.struct_time object for comparison
                 modifyDateTime = time.localtime(modifyTime)
 
-                # set fileFound to true and break if a file is found to be
-                # modified after the given modify date
-
+                # Check if this file was modified after the given threshold date.
+                # If so, we found our most recent file for this directory branch.
                 if modifyDateTime > modifyDateLimit:
                     fileFound = True
                     foundFilePath = filePath
                     foundFileModifiedDate = modifyDateTime
-                    # Break out of file loop
+                    # Break out of file loop to move to next directory branch
                     break
 
+            # If we found a recent file, stop searching deeper in this branch
             if fileFound:
                 # Since we found a file that was modified after the given
                 # modify date, we can break out of the os.walk loop
                 break
 
-            # print the name of the top level folder
-            # if previous break statement was triggered
-
+        # Output the results for this top-level directory
         if fileFound:
+            # Write to stdout and CSV file: folder, file path, and modification date
             print(
                 unicodedata.normalize("NFC", dirPath),
                 " ",
@@ -82,6 +111,7 @@ def searchFiles(rootDirectory, modifyDateLimit, excludedFiles):
                 )
 
         else:
+            # No files found modified after the threshold date
             print(
                 unicodedata.normalize("NFC", dirPath),
                 " - no modification found after ",
@@ -96,9 +126,15 @@ def searchFiles(rootDirectory, modifyDateLimit, excludedFiles):
                 )
 
 
+# ============================================================================
+# Main Script Execution
+# ============================================================================
+
+# Set the date threshold for file modification checks
 dateLimit = "01/01/2016"
 modifyDateLimit = time.strptime(dateLimit, "%m/%d/%Y")
 
+# Files to exclude from the search (system and temporary files)
 excludedFiles = [
     "Thumbs.db",
     "desktop.ini",
@@ -109,7 +145,6 @@ excludedFiles = [
 ]
 
 # take user input for the root directory and output file name
-
 directory = input("Input root directory to parse:\n")
 outputFile = input("Input output file name:\n")
 

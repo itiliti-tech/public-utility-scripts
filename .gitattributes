@@ -1,0 +1,18 @@
+# Default to LF for all files
+* text=auto eol=lf
+
+# Windows-specific files that require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Explicitly use LF for shell scripts and hooks
+*.sh text eol=lf
+.git/hooks/* text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
