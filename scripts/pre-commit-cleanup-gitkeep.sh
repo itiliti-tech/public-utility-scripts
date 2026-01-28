@@ -14,7 +14,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 cd "$REPO_ROOT"
 
 # Directories that should always have .gitkeep if empty
-PRESERVED_DIRS=("src" "scripts" "docs" ".config")
+PRESERVED_DIRS=("src" "scripts" "docs" ".config", ".github")
 
 # Step 1: Remove unnecessary .gitkeep files from directories with content
 while IFS= read -r gitkeep_file; do
