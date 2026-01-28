@@ -5,6 +5,8 @@ that starts today (or StartDate) and stays open for 7 days (or InstanceDurationI
 Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
+
+Last Modified: 2026-01-28 12:23
 #>
 
 param(
@@ -24,7 +26,10 @@ param(
     [string] $NewDisplayNameSuffix = " - Reopened (One-time)",
 
     [Parameter(Mandatory = $false)]
-    [switch] $WhatIf
+    [switch] $WhatIf,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DumpDefinition
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,7 +134,7 @@ function coerceGraphValue {
 function normalizeCommonGraphKeys {
     param($ht)
     if (-not ($ht -is [System.Collections.IDictionary])) { return $ht }
-    
+
     if ($ht.ContainsKey('Query') -and -not $ht.ContainsKey('query')) {
         $ht['query'] = $ht['Query']
         $ht.Remove('Query') | Out-Null
@@ -147,14 +152,14 @@ function normalizeCommonGraphKeys {
 
 function normalizeGraphStructureRecursively {
     param($obj)
-    
+
     if ($null -eq $obj) { return $null }
-    
+
     if ($obj -is [System.Collections.IDictionary]) {
         $obj = normalizeCommonGraphKeys $obj
         foreach ($k in @($obj.Keys)) {
             $obj[$k] = normalizeGraphStructureRecursively $obj[$k]
-            
+
             # Ensure certain properties are arrays
             if ($k -in @('principalScopes', 'resourceScopes', 'fallbackReviewers')) {
                 if ($obj[$k] -isnot [System.Collections.IList] -and $null -ne $obj[$k]) {
@@ -168,7 +173,7 @@ function normalizeGraphStructureRecursively {
         }
         return $obj
     }
-    
+
     if ($obj -is [System.Collections.IList]) {
         $arr = @()
         foreach ($item in $obj) {
@@ -176,7 +181,7 @@ function normalizeGraphStructureRecursively {
         }
         return $arr
     }
-    
+
     return $obj
 }
 
@@ -348,7 +353,7 @@ function processAccessReviewDefinition {
             }
         }
 
-        function Has-DictKey {
+        function Test-DictKey {
             param($dict, $key)
             if ($dict -is [System.Collections.IDictionary]) {
                 return $dict.ContainsKey($key)
@@ -358,20 +363,20 @@ function processAccessReviewDefinition {
         }
 
         # Try to extract query from resourceScopes first
-        if (Has-DictKey $scopeData 'resourceScopes') {
+        if (Test-DictKey $scopeData 'resourceScopes') {
             $resourceScopes = Get-DictValue $scopeData 'resourceScopes'
             if ($resourceScopes -and $resourceScopes -is [System.Collections.IList] -and $resourceScopes.Count -gt 0) {
                 $primaryQuery = Get-DictValue $resourceScopes[0] 'query'
             }
         }
-        
+
         # If still no query, try direct query property
-        if (-not $primaryQuery -and (Has-DictKey $scopeData 'query')) {
+        if (-not $primaryQuery -and (Test-DictKey $scopeData 'query')) {
             $primaryQuery = Get-DictValue $scopeData 'query'
         }
 
         # If still no query, try principalScopes
-        if (-not $primaryQuery -and (Has-DictKey $scopeData 'principalScopes')) {
+        if (-not $primaryQuery -and (Test-DictKey $scopeData 'principalScopes')) {
             $principalScopes = Get-DictValue $scopeData 'principalScopes'
             if ($principalScopes -and $principalScopes -is [System.Collections.IList] -and $principalScopes.Count -gt 0) {
                 $primaryQuery = Get-DictValue $principalScopes[0] 'query'
@@ -425,7 +430,7 @@ function processAccessReviewDefinition {
             recurrence              = buildOneTimeRecurrence $StartDate
             instanceDurationInDays  = $InstanceDurationInDays
         }
-        
+
         # Add fallbackReviewers if they exist
         $fallbackReviewersArr = @(convertReviewerScopesToArray $old.FallbackReviewers)
         if ($fallbackReviewersArr.Count -gt 0) {
@@ -472,6 +477,61 @@ function processAccessReviewDefinition {
 
 # ---------------- Connect & load ----------------
 Import-Module Microsoft.Graph.Identity.Governance -ErrorAction Stop
+
+# If DumpDefinition mode, connect and dump, then exit
+if ($DumpDefinition.IsPresent) {
+    if (-not (Get-MgContext)) {
+        Connect-MgGraph -Scopes "AccessReview.Read.All"
+    }
+
+    foreach ($defId in $DefinitionIds) {
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "Definition ID: $defId" -ForegroundColor Cyan
+        Write-Host "========================================`n" -ForegroundColor Cyan
+
+        try {
+            $definition = Get-MgIdentityGovernanceAccessReviewDefinition -AccessReviewScheduleDefinitionId $defId
+
+            # Fully convert the definition object to a hashtable with all nested objects expanded
+            $convertedDef = @{
+                Id                               = $definition.Id
+                DisplayName                      = $definition.DisplayName
+                DescriptionForAdmins             = $definition.DescriptionForAdmins
+                DescriptionForReviewers          = $definition.DescriptionForReviewers
+                CreatedDateTime                  = if ($definition.CreatedDateTime) { $definition.CreatedDateTime.ToString('o') } else { $null }
+                LastModifiedDateTime             = if ($definition.LastModifiedDateTime) { $definition.LastModifiedDateTime.ToString('o') } else { $null }
+                Status                           = $definition.Status
+                InstanceDurationInDays           = $definition.InstanceDurationInDays
+                Scope                            = unwrapGraphObject $definition.Scope
+                Reviewers                        = @(convertReviewerScopesToArray $definition.Reviewers)
+                FallbackReviewers                = @(convertReviewerScopesToArray $definition.FallbackReviewers)
+                Settings                         = unwrapGraphObject $definition.Settings
+                InstanceEnumerationScope         = unwrapGraphObject $definition.InstanceEnumerationScope
+                Recurrence                       = unwrapGraphObject $definition.Recurrence
+                AdditionalNotificationRecipients = @(convertAdditionalRecipientsToArray $definition.AdditionalNotificationRecipients)
+            }
+
+            # Remove null values
+            removeNullsRecursively -obj $convertedDef
+
+            # Convert to JSON with full depth for complete text representation
+            $jsonOutput = $convertedDef | ConvertTo-Json -Depth 100
+            Write-Host $jsonOutput
+            Write-Host ""
+
+        } catch {
+            Write-Host "Failed to dump definition $defId : $_" -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+    }
+
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "Dump complete." -ForegroundColor Cyan
+    Write-Host "========================================`n" -ForegroundColor Cyan
+    exit 0
+}
+
+# Connect for normal processing
 if (-not (Get-MgContext)) {
     Connect-MgGraph -Scopes "AccessReview.ReadWrite.All"
 }
