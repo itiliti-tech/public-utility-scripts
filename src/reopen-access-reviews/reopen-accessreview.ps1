@@ -9,7 +9,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 14:43
+Last Modified: 2026-01-28 14:49
 Fixed: Settings structure, scope handling, description defaults, tenant compatibility
 #>
 
@@ -562,25 +562,32 @@ function Save-OutputLog {
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $outputFileName = "output-accessreview-$DefinitionId-$timestamp.json"
 
-        $outputData = @{
-            ScriptName         = $ScriptName
-            ScriptLastModified = $LastModifiedDate
-            Timestamp          = $timestamp
-            DefinitionId       = $DefinitionId
-            Success            = $IsSuccess
+        # Build output in specific order: script, invocation, originalDefinition, body
+        $outputData = [ordered]@{
+            Script     = [ordered]@{
+                ScriptName         = $ScriptName
+                ScriptLastModified = $LastModifiedDate
+            }
+            Invocation = [ordered]@{
+                DefinitionId = $DefinitionId
+                Timestamp    = $timestamp
+                Success      = $IsSuccess
+            }
         }
 
+        # Add problematic settings to invocation if detected
         if ($ProblematicSettings -and $ProblematicSettings.Count -gt 0) {
-            $outputData['ProblematicSettingsDetected'] = $ProblematicSettings
+            $outputData['Invocation']['ProblematicSettingsDetected'] = $ProblematicSettings
         }
 
+        # Add error details to invocation if not successful
         if (-not $IsSuccess) {
-            $outputData['ErrorMessage'] = $ErrorMessage
-            $outputData['ErrorDetails'] = $ErrorDetails
+            $outputData['Invocation']['ErrorMessage'] = $ErrorMessage
+            $outputData['Invocation']['ErrorDetails'] = $ErrorDetails
         }
 
         $outputData['OriginalDefinition'] = $Definition
-        $outputData['AttemptedBody'] = $Body
+        $outputData['Body'] = $Body
 
         $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
 
