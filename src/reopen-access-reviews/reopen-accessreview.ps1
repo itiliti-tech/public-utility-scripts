@@ -9,7 +9,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 14:49
+Last Modified: 2026-01-28 15:09
 Fixed: Settings structure, scope handling, description defaults, tenant compatibility
 #>
 
@@ -500,13 +500,40 @@ function Test-ProblematicSettings {
 
     # Check for problematic settings that were removed in simplified implementation
     if ($Settings.PSObject.Properties['RecommendationLookBackDuration']) {
-        $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+        $value = $Settings.RecommendationLookBackDuration
+        # Only warn if it has actual data (not empty/null)
+        if ($value -and ($value.PSObject.Properties.Count -gt 0 -or $value -is [timespan])) {
+            $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+        }
     }
 
     if ($Settings.PSObject.Properties['RecommendationInsightSettings']) {
         $value = $Settings.RecommendationInsightSettings
-        if ($value) {
-            $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+        # Only warn if it has actual data (not empty array or array of empty objects)
+        if ($value -and $value.Count -gt 0) {
+            $hasNonEmptyItems = $false
+            foreach ($item in $value) {
+                # Check if item has properties beyond just AdditionalProperties
+                # or if AdditionalProperties itself has content
+                $propCount = $item.PSObject.Properties.Count
+                if ($propCount -eq 0) {
+                    # Truly empty object
+                    continue
+                } elseif ($propCount -eq 1 -and $item.PSObject.Properties.Name -contains 'AdditionalProperties') {
+                    # Only has AdditionalProperties - check if that's empty
+                    if ($item.AdditionalProperties -and $item.AdditionalProperties.Count -gt 0) {
+                        $hasNonEmptyItems = $true
+                        break
+                    }
+                } else {
+                    # Has other properties besides AdditionalProperties
+                    $hasNonEmptyItems = $true
+                    break
+                }
+            }
+            if ($hasNonEmptyItems) {
+                $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+            }
         }
     }
 
