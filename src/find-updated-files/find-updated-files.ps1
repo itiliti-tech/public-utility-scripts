@@ -14,7 +14,7 @@
     The output CSV filename. If not provided, will prompt for input.
 
 .PARAMETER DateLimit
-    The date threshold for file modification checks (format: MM/dd/yyyy).
+    The date threshold for file modification checks (format: M/d/yyyy or MM/dd/yyyy).
     Default: 01/01/2016
 
 .PARAMETER ExcludedFiles
@@ -57,9 +57,9 @@ if ([string]::IsNullOrWhiteSpace($OutputFile)) {
 
 # Convert date string to datetime object for comparison
 try {
-    $ModifyDateLimit = [datetime]::ParseExact($DateLimit, "MM/dd/yyyy", $null)
+    $ModifyDateLimit = [datetime]::ParseExact($DateLimit, "M/d/yyyy", $null)
 } catch {
-    Write-Error "Invalid date format. Please use MM/dd/yyyy"
+    Write-Error "Invalid date format. Please use M/d/yyyy (e.g., 1/1/2016 or 01/01/2016)"
     exit 1
 }
 
