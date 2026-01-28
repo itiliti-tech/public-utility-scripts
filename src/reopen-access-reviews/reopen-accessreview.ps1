@@ -2,11 +2,15 @@
 Clone an existing Access Review schedule definition by ID and create a NEW one-time definition
 that starts today (or StartDate) and stays open for 7 days (or InstanceDurationInDays).
 
+Supports both simple accessReviewQueryScope and complex principalResourceMembershipsScope
+with multiple principal and resource scopes (including B2B direct connect users and shared channels).
+
 Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 12:28
+Last Modified: 2026-01-28 12:50
+Fixed: Settings structure, scope handling, description defaults
 #>
 
 param(
@@ -234,6 +238,50 @@ function unwrapGraphObject {
     return normalizeGraphStructureRecursively $h
 }
 
+function normalizeQueryScopeItem {
+    param($item)
+    if (-not $item) { return $null }
+
+    $unwrapped = unwrapGraphObject $item
+    if ($unwrapped -isnot [System.Collections.IDictionary]) { return $null }
+
+    # Build a clean scope with normalized keys
+    $normalized = @{
+        '@odata.type' = if ($unwrapped.'@odata.type') { $unwrapped.'@odata.type' } else { '#microsoft.graph.accessReviewQueryScope' }
+    }
+
+    # Add query if present
+    if ($unwrapped.ContainsKey('query') -and $unwrapped['query']) {
+        $normalized['query'] = $unwrapped['query']
+    }
+
+    # Add queryType if present
+    if ($unwrapped.ContainsKey('queryType') -and $unwrapped['queryType']) {
+        $normalized['queryType'] = $unwrapped['queryType']
+    }
+
+    # Add queryRoot if present (used in some reviewer scopes)
+    if ($unwrapped.ContainsKey('queryRoot') -and $unwrapped['queryRoot']) {
+        $normalized['queryRoot'] = $unwrapped['queryRoot']
+    }
+
+    return $normalized
+}
+
+function normalizeQueryScopeArray {
+    param($items)
+    if (-not $items) { return @() }
+
+    $result = @()
+    foreach ($item in @($items)) {
+        $normalized = normalizeQueryScopeItem $item
+        if ($normalized) {
+            $result += $normalized
+        }
+    }
+    return $result
+}
+
 function convertReviewerScopesToArray {
     param($items)
     if (-not $items) { return @() }
@@ -243,13 +291,24 @@ function convertReviewerScopesToArray {
         $h = unwrapGraphObject $i
         if (-not $h) { continue }
         if ($h -isnot [System.Collections.IDictionary]) { continue }
-        if (-not $h.ContainsKey('@odata.type')) { $h['@odata.type'] = '#microsoft.graph.accessReviewReviewerScope' }
-        if ($h.ContainsKey('query') -and $h['query']) {
-            if (-not $h.ContainsKey('queryType') -or -not $h['queryType']) { $h['queryType'] = 'MicrosoftGraph' }
-        }
-        # MUST have query
+
+        # PowerShell hashtables are case-insensitive, so Query and query are the same key
+        # Check for query (case-insensitive check will find Query, query, etc.)
         if (-not $h.ContainsKey('query') -or -not $h['query']) { continue }
-        $out += $h
+
+        # Build a NEW hashtable with lowercase keys to ensure JSON serialization is correct
+        $normalized = @{
+            '@odata.type' = '#microsoft.graph.accessReviewReviewerScope'
+            'query'       = $h['query']
+            'queryType'   = if ($h.ContainsKey('queryType') -and $h['queryType']) { $h['queryType'] } else { 'MicrosoftGraph' }
+        }
+
+        # Add queryRoot if it exists and is not null/empty
+        if ($h.ContainsKey('queryRoot') -and $h['queryRoot']) {
+            $normalized['queryRoot'] = $h['queryRoot']
+        }
+
+        $out += $normalized
     }
     return $out
 }
@@ -309,6 +368,95 @@ function buildOneTimeRecurrence {
     }
 }
 
+# Build settings object with all required fields
+function buildSettingsObject {
+    param(
+        [object]$oldSettings,
+        [datetime]$StartDate,
+        [int]$InstanceDurationInDays
+    )
+
+    # Start with a safe subset of settings from the old definition
+    $settingsHt = @{}
+
+    foreach ($k in @(
+            'mailNotificationsEnabled',
+            'reminderNotificationsEnabled',
+            'justificationRequiredOnApproval',
+            'defaultDecisionEnabled',
+            'defaultDecision',
+            'recommendationsEnabled',
+            'autoApplyDecisionsEnabled',
+            'accessRecommendationsEnabled',
+            'decisionHistoriesForReviewersEnabled'
+        )) {
+        if ($oldSettings -and $oldSettings.PSObject.Properties[$k]) {
+            $settingsHt[$k] = $oldSettings.$k
+        }
+    }
+
+    # Set the instance duration and recurrence at the settings level
+    $settingsHt['instanceDurationInDays'] = $InstanceDurationInDays
+    $settingsHt['recurrence'] = buildOneTimeRecurrence $StartDate
+
+    return $settingsHt
+}
+
+# ---------------- Debug file generation ----------------
+function Prompt-GenerateDebugFile {
+    param(
+        [string]$DefinitionId,
+        [object]$Definition,
+        [object]$Body,
+        [string]$ErrorMessage,
+        [string]$ErrorDetails
+    )
+
+    Write-Host "`n" -NoNewline
+    Write-Host "Would you like to generate a debug file for the developer? [Y/n] (Auto-yes in 5 seconds): " -ForegroundColor Yellow -NoNewline
+
+    $timeout = 5
+    $startTime = Get-Date
+    $response = $null
+
+    while (((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            $response = $key.KeyChar.ToString().ToLower()
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    if ($null -eq $response -or $response -eq '' -or $response -eq 'y') {
+        Write-Host "Yes"
+
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $debugFileName = "debug-accessreview-$DefinitionId-$timestamp.json"
+
+        $debugData = @{
+            Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            DefinitionId = $DefinitionId
+            Definition   = $Definition
+            RequestBody  = $Body
+            Error        = @{
+                Message = $ErrorMessage
+                Details = $ErrorDetails
+            }
+        }
+
+        try {
+            $debugData | ConvertTo-Json -Depth 100 | Out-File -FilePath $debugFileName -Encoding UTF8
+            Write-Host "Debug file created: $debugFileName" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to create debug file: $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "No"
+        Write-Host "Debug file generation skipped." -ForegroundColor Yellow
+    }
+}
+
 # ---------------- Main processing function ----------------
 function processAccessReviewDefinition {
     param(
@@ -327,12 +475,8 @@ function processAccessReviewDefinition {
         $old = Get-MgIdentityGovernanceAccessReviewDefinition -AccessReviewScheduleDefinitionId $DefinitionId
 
         # ---------------- Build new payload ----------------
-        # OPTION A: Convert to simple accessReviewQueryScope (non-custom scope)
-        # Extract the primary query from the old scope
-        $oldScope = $old.Scope
-        $primaryQuery = $null
-
         # Unwrap SDK object - actual scope data is in AdditionalProperties
+        $oldScope = $old.Scope
         if ($oldScope.PSObject.Properties['AdditionalProperties'] -and $oldScope.AdditionalProperties) {
             $scopeData = $oldScope.AdditionalProperties
         } else {
@@ -340,59 +484,22 @@ function processAccessReviewDefinition {
         }
 
         Write-Host "Scope data type: $($scopeData.GetType().Name)" -ForegroundColor Cyan
-        Write-Host "Scope data: $(($scopeData | ConvertTo-Json -Depth 5))" -ForegroundColor Cyan
+        Write-Host "Scope @odata.type: $(if ($scopeData.'@odata.type') { $scopeData.'@odata.type' } else { 'N/A' })" -ForegroundColor Cyan
 
-        # Helper function to safely get dictionary values
-        function Get-DictValue {
-            param($dict, $key)
-            if ($dict -is [System.Collections.IDictionary]) {
-                return $dict[$key]
-            } else {
-                return $dict.PSObject.Properties[$key].Value
+        # Unwrap and properly structure the scope based on its type
+        $scopeHt = unwrapGraphObject $scopeData
+
+        # Ensure @odata.type is present (required for principalResourceMembershipsScope)
+        if (-not $scopeHt.'@odata.type') {
+            # If missing, try to determine from structure
+            if ($scopeHt.ContainsKey('principalScopes') -or $scopeHt.ContainsKey('resourceScopes')) {
+                $scopeHt.'@odata.type' = '#microsoft.graph.principalResourceMembershipsScope'
+            } elseif ($scopeHt.ContainsKey('query')) {
+                $scopeHt.'@odata.type' = '#microsoft.graph.accessReviewQueryScope'
             }
         }
 
-        function Test-DictKey {
-            param($dict, $key)
-            if ($dict -is [System.Collections.IDictionary]) {
-                return $dict.ContainsKey($key)
-            } else {
-                return $null -ne $dict.PSObject.Properties[$key]
-            }
-        }
-
-        # Try to extract query from resourceScopes first
-        if (Test-DictKey $scopeData 'resourceScopes') {
-            $resourceScopes = Get-DictValue $scopeData 'resourceScopes'
-            if ($resourceScopes -and $resourceScopes -is [System.Collections.IList] -and $resourceScopes.Count -gt 0) {
-                $primaryQuery = Get-DictValue $resourceScopes[0] 'query'
-            }
-        }
-
-        # If still no query, try direct query property
-        if (-not $primaryQuery -and (Test-DictKey $scopeData 'query')) {
-            $primaryQuery = Get-DictValue $scopeData 'query'
-        }
-
-        # If still no query, try principalScopes
-        if (-not $primaryQuery -and (Test-DictKey $scopeData 'principalScopes')) {
-            $principalScopes = Get-DictValue $scopeData 'principalScopes'
-            if ($principalScopes -and $principalScopes -is [System.Collections.IList] -and $principalScopes.Count -gt 0) {
-                $primaryQuery = Get-DictValue $principalScopes[0] 'query'
-            }
-        }
-
-        $scopeDataKeys = if ($scopeData -is [System.Collections.IDictionary]) { $scopeData.Keys -join ', ' } else { $scopeData.PSObject.Properties.Name -join ', ' }
-        if (-not $primaryQuery) {
-            throw "Could not extract primary query from old definition scope. Scope keys: $scopeDataKeys"
-        }
-
-        # Build simple accessReviewQueryScope (Option A)
-        # Note: Do NOT include queryType for basic scopes - it triggers custom scoping validation
-        $scopeHt = @{
-            '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
-            'query'       = normalizeGraphPathVersion $primaryQuery
-        }
+        Write-Host "Using scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
 
         $reviewersArr = @(convertReviewerScopesToArray $old.Reviewers)
 
@@ -400,48 +507,24 @@ function processAccessReviewDefinition {
             throw "No valid reviewers found after conversion (Graph requires reviewers with query/queryType)."
         }
 
-        # Settings: copy a safe subset, then override recurrence + duration
-        $settings = $old.Settings
-        $settingsHt = @{}
-
-        foreach ($k in @(
-                'mailNotificationsEnabled',
-                'reminderNotificationsEnabled',
-                'justificationRequiredOnApproval',
-                'defaultDecisionEnabled',
-                'defaultDecision',
-                'recommendationsEnabled',
-                'autoApplyDecisionsEnabled',
-                'accessRecommendationsEnabled',
-                'decisionHistoriesForReviewersEnabled'
-            )) {
-            if ($settings -and $settings.PSObject.Properties[$k]) { $settingsHt[$k] = $settings.$k }
-        }
+        # Build settings with proper structure (includes recurrence and instanceDurationInDays)
+        $settingsHt = buildSettingsObject -oldSettings $old.Settings -StartDate $StartDate -InstanceDurationInDays $InstanceDurationInDays
 
         # Build the body for the new definition
+        # Based on MS documentation: recurrence and instanceDurationInDays go INSIDE settings
         $body = @{
             displayName             = $old.DisplayName + $NewDisplayNameSuffix
-            descriptionForAdmins    = $old.DescriptionForAdmins
-            descriptionForReviewers = $old.DescriptionForReviewers
+            descriptionForAdmins    = if ($old.DescriptionForAdmins) { $old.DescriptionForAdmins } else { "Cloned from $DefinitionId on $(Get-Date -Format 'yyyy-MM-dd')" }
+            descriptionForReviewers = if ($old.DescriptionForReviewers) { $old.DescriptionForReviewers } else { "Please review your access." }
             scope                   = $scopeHt
             reviewers               = $reviewersArr
             settings                = $settingsHt
-            recurrence              = buildOneTimeRecurrence $StartDate
-            instanceDurationInDays  = $InstanceDurationInDays
         }
 
         # Add fallbackReviewers if they exist
         $fallbackReviewersArr = @(convertReviewerScopesToArray $old.FallbackReviewers)
         if ($fallbackReviewersArr.Count -gt 0) {
             $body['fallbackReviewers'] = $fallbackReviewersArr
-        }
-
-        # Ensure required descriptions
-        if (-not $body.descriptionForAdmins -or [string]::IsNullOrWhiteSpace($body.descriptionForAdmins)) {
-            $body.descriptionForAdmins = "Cloned from $OldDefinitionId on $(Get-Date -Format 'yyyy-MM-dd')"
-        }
-        if (-not $body.descriptionForReviewers -or [string]::IsNullOrWhiteSpace($body.descriptionForReviewers)) {
-            $body.descriptionForReviewers = "Please review your access."
         }
 
         removeNullsRecursively -obj $body
@@ -455,22 +538,45 @@ function processAccessReviewDefinition {
         }
 
         try {
-            $newDef = New-MgIdentityGovernanceAccessReviewDefinition -BodyParameter $body
+            $newDef = New-MgIdentityGovernanceAccessReviewDefinition -BodyParameter $body -ErrorAction Stop
             Write-Host "`nCreated Access Review Definition Id: $($newDef.Id)" -ForegroundColor Green
             return $newDef
         } catch {
-            Write-Host "`nCreation failed." -ForegroundColor Red
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                Write-Host "`n--- ErrorDetails.Message ---" -ForegroundColor Red
-                Write-Host $_.ErrorDetails.Message
+            Write-Host "`n========================================" -ForegroundColor Red
+            Write-Host "ERROR: Creation Failed" -ForegroundColor Red
+            Write-Host "========================================" -ForegroundColor Red
+
+            $errorMsg = $_.Exception.Message
+            $errorDetails = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { "" }
+
+            Write-Host "`nError Message:" -ForegroundColor Red
+            Write-Host $errorMsg
+
+            if ($errorDetails) {
+                Write-Host "`nError Details:" -ForegroundColor Red
+                Write-Host $errorDetails
             }
-            Write-Host "`n--- Exception ---" -ForegroundColor Red
-            Write-Host $_.Exception.Message
-            throw
+
+            Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
+
+            # Prompt for debug file generation
+            Prompt-GenerateDebugFile -DefinitionId $DefinitionId -Definition $old -Body $body -ErrorMessage $errorMsg -ErrorDetails $errorDetails
+
+            Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
+            return $null
         }
     } catch {
-        Write-Host "Failed to process definition $DefinitionId : $_" -ForegroundColor Red
-        throw
+        Write-Host "`n========================================" -ForegroundColor Red
+        Write-Host "ERROR: Failed to Process Definition" -ForegroundColor Red
+        Write-Host "========================================" -ForegroundColor Red
+        Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
+        Write-Host "`nError: $_" -ForegroundColor Red
+
+        # Prompt for debug file generation
+        Prompt-GenerateDebugFile -DefinitionId $DefinitionId -Definition $null -Body $null -ErrorMessage $_.Exception.Message -ErrorDetails ""
+
+        Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
+        return $null
     }
 }
 
