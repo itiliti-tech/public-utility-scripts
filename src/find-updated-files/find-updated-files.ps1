@@ -58,8 +58,7 @@ if ([string]::IsNullOrWhiteSpace($OutputFile)) {
 # Convert date string to datetime object for comparison
 try {
     $ModifyDateLimit = [datetime]::ParseExact($DateLimit, "MM/dd/yyyy", $null)
-}
-catch {
+} catch {
     Write-Error "Invalid date format. Please use MM/dd/yyyy"
     exit 1
 }
@@ -76,7 +75,7 @@ if (-not (Test-Path -Path $RootDirectory -PathType Container)) {
 
 .DESCRIPTION
     Recursively searches directories for the most recently modified file.
-    
+
     Scans the root directory and its subdirectories to find files modified
     after the specified date. For each top-level folder, outputs the most
     recently modified file and its modification date.
@@ -139,8 +138,7 @@ function Search-UpdatedFiles {
             # Write to CSV file with proper quoting
             $CsvLine = "`"$DirPath`",`"$FormattedDate`",`"$FoundFilePath`""
             Add-Content -Path $OutputFile -Value $CsvLine -Encoding UTF8
-        }
-        else {
+        } else {
             # No files found modified after the threshold date
             $FormattedDateLimit = $ModifyDateLimit.ToString("MM/dd/yyyy")
             Write-Host "$DirPath - no modification found after $FormattedDateLimit"
@@ -162,13 +160,12 @@ try {
 
     # Execute the search
     Search-UpdatedFiles -RootDirectory $RootDirectory `
-                        -ModifyDateLimit $ModifyDateLimit `
-                        -ExcludedFiles $ExcludedFiles `
-                        -OutputFile $OutputFile
+        -ModifyDateLimit $ModifyDateLimit `
+        -ExcludedFiles $ExcludedFiles `
+        -OutputFile $OutputFile
 
     Write-Host "✓ Scan complete. Results written to: $OutputFile"
-}
-catch {
+} catch {
     Write-Error "Error: $_"
     exit 1
 }
