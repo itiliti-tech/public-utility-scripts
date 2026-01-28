@@ -240,3 +240,4 @@ __azurite_db*__.json
 *.bicep.params.json
 # ARM Templates
 *.parameters.json
+src/reopen-access-reviews/debug-accessreview-*.json

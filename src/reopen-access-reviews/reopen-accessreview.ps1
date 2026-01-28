@@ -2,9 +2,15 @@
 Clone an existing Access Review schedule definition by ID and create a NEW one-time definition
 that starts today (or StartDate) and stays open for 7 days (or InstanceDurationInDays).
 
+Supports both simple accessReviewQueryScope and complex principalResourceMembershipsScope
+with multiple principal and resource scopes (including B2B direct connect users and shared channels).
+
 Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
+
+Last Modified: 2026-01-28 13:35
+Fixed: Settings structure, scope handling, description defaults
 #>
 
 param(
@@ -18,16 +24,46 @@ param(
     [datetime] $StartDate = (Get-Date),   # default: today
 
     [Parameter(Mandatory = $false)]
-    [int] $InstanceDurationInDays = 7,    # default: one week open
+    [int] $InstanceDurationInDays = 30,    # default: 30 days open
 
     [Parameter(Mandatory = $false)]
     [string] $NewDisplayNameSuffix = " - Reopened (One-time)",
 
     [Parameter(Mandatory = $false)]
-    [switch] $WhatIf
+    [switch] $WhatIf,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DumpDefinition,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $SuppressOutputLogs,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DisplayBody
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---------------- Script Metadata ----------------
+$ScriptName = Split-Path -Leaf $PSCommandPath
+$LastModifiedDate = "Unknown"
+
+# Extract Last Modified date from header
+try {
+    $headerContent = Get-Content $PSCommandPath -First 20 -ErrorAction SilentlyContinue
+    $lastModifiedLine = $headerContent | Where-Object { $_ -match 'Last Modified:\s*(.+)' } | Select-Object -First 1
+    if ($lastModifiedLine -and $Matches[1]) {
+        $LastModifiedDate = $Matches[1].Trim()
+    }
+} catch {
+    # If we can't read the file, just use Unknown
+}
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Script: $ScriptName" -ForegroundColor Cyan
+Write-Host "Last Modified: $LastModifiedDate" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
 
 # Build list of IDs to process
 $DefinitionIds = @()
@@ -129,7 +165,7 @@ function coerceGraphValue {
 function normalizeCommonGraphKeys {
     param($ht)
     if (-not ($ht -is [System.Collections.IDictionary])) { return $ht }
-    
+
     if ($ht.ContainsKey('Query') -and -not $ht.ContainsKey('query')) {
         $ht['query'] = $ht['Query']
         $ht.Remove('Query') | Out-Null
@@ -147,14 +183,14 @@ function normalizeCommonGraphKeys {
 
 function normalizeGraphStructureRecursively {
     param($obj)
-    
+
     if ($null -eq $obj) { return $null }
-    
+
     if ($obj -is [System.Collections.IDictionary]) {
         $obj = normalizeCommonGraphKeys $obj
         foreach ($k in @($obj.Keys)) {
             $obj[$k] = normalizeGraphStructureRecursively $obj[$k]
-            
+
             # Ensure certain properties are arrays
             if ($k -in @('principalScopes', 'resourceScopes', 'fallbackReviewers')) {
                 if ($obj[$k] -isnot [System.Collections.IList] -and $null -ne $obj[$k]) {
@@ -168,7 +204,7 @@ function normalizeGraphStructureRecursively {
         }
         return $obj
     }
-    
+
     if ($obj -is [System.Collections.IList]) {
         $arr = @()
         foreach ($item in $obj) {
@@ -176,7 +212,7 @@ function normalizeGraphStructureRecursively {
         }
         return $arr
     }
-    
+
     return $obj
 }
 
@@ -229,6 +265,50 @@ function unwrapGraphObject {
     return normalizeGraphStructureRecursively $h
 }
 
+function normalizeQueryScopeItem {
+    param($item)
+    if (-not $item) { return $null }
+
+    $unwrapped = unwrapGraphObject $item
+    if ($unwrapped -isnot [System.Collections.IDictionary]) { return $null }
+
+    # Build a clean scope with normalized keys
+    $normalized = @{
+        '@odata.type' = if ($unwrapped.'@odata.type') { $unwrapped.'@odata.type' } else { '#microsoft.graph.accessReviewQueryScope' }
+    }
+
+    # Add query if present
+    if ($unwrapped.ContainsKey('query') -and $unwrapped['query']) {
+        $normalized['query'] = $unwrapped['query']
+    }
+
+    # Add queryType if present
+    if ($unwrapped.ContainsKey('queryType') -and $unwrapped['queryType']) {
+        $normalized['queryType'] = $unwrapped['queryType']
+    }
+
+    # Add queryRoot if present (used in some reviewer scopes)
+    if ($unwrapped.ContainsKey('queryRoot') -and $unwrapped['queryRoot']) {
+        $normalized['queryRoot'] = $unwrapped['queryRoot']
+    }
+
+    return $normalized
+}
+
+function normalizeQueryScopeArray {
+    param($items)
+    if (-not $items) { return @() }
+
+    $result = @()
+    foreach ($item in @($items)) {
+        $normalized = normalizeQueryScopeItem $item
+        if ($normalized) {
+            $result += $normalized
+        }
+    }
+    return $result
+}
+
 function convertReviewerScopesToArray {
     param($items)
     if (-not $items) { return @() }
@@ -238,13 +318,24 @@ function convertReviewerScopesToArray {
         $h = unwrapGraphObject $i
         if (-not $h) { continue }
         if ($h -isnot [System.Collections.IDictionary]) { continue }
-        if (-not $h.ContainsKey('@odata.type')) { $h['@odata.type'] = '#microsoft.graph.accessReviewReviewerScope' }
-        if ($h.ContainsKey('query') -and $h['query']) {
-            if (-not $h.ContainsKey('queryType') -or -not $h['queryType']) { $h['queryType'] = 'MicrosoftGraph' }
-        }
-        # MUST have query
+
+        # PowerShell hashtables are case-insensitive, so Query and query are the same key
+        # Check for query (case-insensitive check will find Query, query, etc.)
         if (-not $h.ContainsKey('query') -or -not $h['query']) { continue }
-        $out += $h
+
+        # Build a NEW hashtable with lowercase keys to ensure JSON serialization is correct
+        $normalized = @{
+            '@odata.type' = '#microsoft.graph.accessReviewReviewerScope'
+            'query'       = $h['query']
+            'queryType'   = if ($h.ContainsKey('queryType') -and $h['queryType']) { $h['queryType'] } else { 'MicrosoftGraph' }
+        }
+
+        # Add queryRoot if it exists and is not null/empty
+        if ($h.ContainsKey('queryRoot') -and $h['queryRoot']) {
+            $normalized['queryRoot'] = $h['queryRoot']
+        }
+
+        $out += $normalized
     }
     return $out
 }
@@ -304,6 +395,156 @@ function buildOneTimeRecurrence {
     }
 }
 
+# Build settings object with all required fields
+function buildSettingsObject {
+    param(
+        [object]$oldSettings,
+        [datetime]$StartDate,
+        [int]$InstanceDurationInDays
+    )
+
+    # Build settings with only essential, safe properties
+    # Avoids problematic settings like recommendationLookBackDuration, recommendationInsightSettings
+    $settingsHt = @{
+        # Core notification settings
+        'mailNotificationsEnabled'        = if ($oldSettings.PSObject.Properties['MailNotificationsEnabled']) { $oldSettings.MailNotificationsEnabled } else { $true }
+        'reminderNotificationsEnabled'    = if ($oldSettings.PSObject.Properties['ReminderNotificationsEnabled']) { $oldSettings.ReminderNotificationsEnabled } else { $true }
+
+        # Approval requirements
+        'justificationRequiredOnApproval' = if ($oldSettings.PSObject.Properties['JustificationRequiredOnApproval']) { $oldSettings.JustificationRequiredOnApproval } else { $true }
+
+        # For one-time reviews, disable recommendations to avoid complex insight settings
+        'recommendationsEnabled'          = $false
+
+        # Default decision when reviewers don't respond
+        'defaultDecisionEnabled'          = if ($oldSettings.PSObject.Properties['DefaultDecisionEnabled']) { $oldSettings.DefaultDecisionEnabled } else { $false }
+        'defaultDecision'                 = if ($oldSettings.PSObject.Properties['DefaultDecision']) { $oldSettings.DefaultDecision } else { 'None' }
+
+        # Auto-apply decisions to resource
+        'autoApplyDecisionsEnabled'       = if ($oldSettings.PSObject.Properties['AutoApplyDecisionsEnabled']) { $oldSettings.AutoApplyDecisionsEnabled } else { $false }
+
+        # Scheduling - set by us for one-time review
+        'instanceDurationInDays'          = $InstanceDurationInDays
+        'recurrence'                      = buildOneTimeRecurrence $StartDate
+    }
+
+    # Copy applyActions if present AND non-empty (actions to apply on denied guest users)
+    if ($oldSettings.PSObject.Properties['ApplyActions']) {
+        $actions = unwrapGraphObject $oldSettings.ApplyActions
+        # Filter out empty objects that cause validation errors
+        $validActions = @($actions | Where-Object {
+                $_ -and ($_ -is [System.Collections.IDictionary]) -and $_.Keys.Count -gt 0
+            })
+        if ($validActions.Count -gt 0) {
+            $settingsHt['applyActions'] = $validActions
+        }
+    }
+
+    return $settingsHt
+}
+
+# ---------------- Problematic Settings Detection ----------------
+function Test-ProblematicSettings {
+    param(
+        [object]$Settings
+    )
+
+    $problematicSettings = @()
+
+    # Check for problematic settings that were removed in simplified implementation
+    if ($Settings.PSObject.Properties['RecommendationLookBackDuration']) {
+        $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+    }
+
+    if ($Settings.PSObject.Properties['RecommendationInsightSettings']) {
+        $value = $Settings.RecommendationInsightSettings
+        if ($value) {
+            $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+        }
+    }
+
+    if ($Settings.PSObject.Properties['AccessRecommendationsEnabled']) {
+        $problematicSettings += "accessRecommendationsEnabled (not supported in v1.0 API)"
+    }
+
+    return $problematicSettings
+}
+
+# ---------------- Output log generation ----------------
+function Save-OutputLog {
+    param(
+        [string]$DefinitionId,
+        [object]$Definition,
+        [object]$Body,
+        [string]$ErrorMessage,
+        [string]$ErrorDetails,
+        [string[]]$ProblematicSettings,
+        [bool]$IsSuccess = $false,
+        [bool]$PromptUser = $false
+    )
+
+    $shouldGenerate = $true
+
+    # If prompting is required (logs were suppressed and error occurred)
+    if ($PromptUser) {
+        Write-Host "`n" -NoNewline
+        Write-Host "Would you like to generate an output log for troubleshooting? [Y/n] (Auto-yes in 5 seconds): " -ForegroundColor Yellow -NoNewline
+
+        $timeout = 5
+        $startTime = Get-Date
+        $response = $null
+
+        while (((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                $response = $key.KeyChar.ToString().ToLower()
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+
+        if ($response -eq 'n') {
+            Write-Host "No"
+            $shouldGenerate = $false
+        } else {
+            Write-Host "Yes"
+        }
+    }
+
+    if ($shouldGenerate) {
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $outputFileName = "output-accessreview-$DefinitionId-$timestamp.json"
+
+        $outputData = @{
+            ScriptName         = $ScriptName
+            ScriptLastModified = $LastModifiedDate
+            Timestamp          = $timestamp
+            DefinitionId       = $DefinitionId
+            Success            = $IsSuccess
+        }
+
+        if ($ProblematicSettings -and $ProblematicSettings.Count -gt 0) {
+            $outputData['ProblematicSettingsDetected'] = $ProblematicSettings
+        }
+
+        if (-not $IsSuccess) {
+            $outputData['ErrorMessage'] = $ErrorMessage
+            $outputData['ErrorDetails'] = $ErrorDetails
+        }
+
+        $outputData['OriginalDefinition'] = $Definition
+        $outputData['AttemptedBody'] = $Body
+
+        $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
+
+        if ($PromptUser) {
+            Write-Host "`nOutput log saved: $outputFileName" -ForegroundColor Green
+        } else {
+            Write-Host "Output log saved: $outputFileName" -ForegroundColor Cyan
+        }
+    }
+}
+
 # ---------------- Main processing function ----------------
 function processAccessReviewDefinition {
     param(
@@ -311,7 +552,9 @@ function processAccessReviewDefinition {
         [datetime]$StartDate,
         [int]$InstanceDurationInDays,
         [string]$NewDisplayNameSuffix,
-        [bool]$IsWhatIf
+        [bool]$IsWhatIf,
+        [bool]$SuppressLogs,
+        [bool]$ShowBody
     )
 
     Write-Host "`n========================================"
@@ -321,14 +564,25 @@ function processAccessReviewDefinition {
     try {
         $old = Get-MgIdentityGovernanceAccessReviewDefinition -AccessReviewScheduleDefinitionId $DefinitionId
 
-        # ---------------- Build new payload ----------------
-        # OPTION A: Convert to simple accessReviewQueryScope (non-custom scope)
-        # Extract the primary query from the old scope
-        $oldScope = $old.Scope
-        $primaryQuery = $null
-        $queryType = "MicrosoftGraph"
+        Write-Host "Source Definition: $($old.DisplayName)" -ForegroundColor White
 
+        # Check for problematic settings
+        $problematicSettings = @()
+        if ($old.Settings) {
+            $problematicSettings = Test-ProblematicSettings -Settings $old.Settings
+            if ($problematicSettings.Count -gt 0) {
+                Write-Host "`n[WARNING] Detected problematic settings in source definition:" -ForegroundColor Yellow
+                foreach ($setting in $problematicSettings) {
+                    Write-Host "  - $setting" -ForegroundColor Yellow
+                }
+                Write-Host "These settings will NOT be copied to the new definition." -ForegroundColor Yellow
+                Write-Host "See output log for details.`n" -ForegroundColor Yellow
+            }
+        }
+
+        # ---------------- Build new payload ----------------
         # Unwrap SDK object - actual scope data is in AdditionalProperties
+        $oldScope = $old.Scope
         if ($oldScope.PSObject.Properties['AdditionalProperties'] -and $oldScope.AdditionalProperties) {
             $scopeData = $oldScope.AdditionalProperties
         } else {
@@ -336,59 +590,22 @@ function processAccessReviewDefinition {
         }
 
         Write-Host "Scope data type: $($scopeData.GetType().Name)" -ForegroundColor Cyan
-        Write-Host "Scope data: $(($scopeData | ConvertTo-Json -Depth 5))" -ForegroundColor Cyan
+        Write-Host "Scope @odata.type: $(if ($scopeData.'@odata.type') { $scopeData.'@odata.type' } else { 'N/A' })" -ForegroundColor Cyan
 
-        # Helper function to safely get dictionary values
-        function Get-DictValue {
-            param($dict, $key)
-            if ($dict -is [System.Collections.IDictionary]) {
-                return $dict[$key]
-            } else {
-                return $dict.PSObject.Properties[$key].Value
+        # Unwrap and properly structure the scope based on its type
+        $scopeHt = unwrapGraphObject $scopeData
+
+        # Ensure @odata.type is present (required for principalResourceMembershipsScope)
+        if (-not $scopeHt.'@odata.type') {
+            # If missing, try to determine from structure
+            if ($scopeHt.ContainsKey('principalScopes') -or $scopeHt.ContainsKey('resourceScopes')) {
+                $scopeHt.'@odata.type' = '#microsoft.graph.principalResourceMembershipsScope'
+            } elseif ($scopeHt.ContainsKey('query')) {
+                $scopeHt.'@odata.type' = '#microsoft.graph.accessReviewQueryScope'
             }
         }
 
-        function Has-DictKey {
-            param($dict, $key)
-            if ($dict -is [System.Collections.IDictionary]) {
-                return $dict.ContainsKey($key)
-            } else {
-                return $null -ne $dict.PSObject.Properties[$key]
-            }
-        }
-
-        # Try to extract query from resourceScopes first
-        if (Has-DictKey $scopeData 'resourceScopes') {
-            $resourceScopes = Get-DictValue $scopeData 'resourceScopes'
-            if ($resourceScopes -and $resourceScopes -is [System.Collections.IList] -and $resourceScopes.Count -gt 0) {
-                $primaryQuery = Get-DictValue $resourceScopes[0] 'query'
-            }
-        }
-        
-        # If still no query, try direct query property
-        if (-not $primaryQuery -and (Has-DictKey $scopeData 'query')) {
-            $primaryQuery = Get-DictValue $scopeData 'query'
-        }
-
-        # If still no query, try principalScopes
-        if (-not $primaryQuery -and (Has-DictKey $scopeData 'principalScopes')) {
-            $principalScopes = Get-DictValue $scopeData 'principalScopes'
-            if ($principalScopes -and $principalScopes -is [System.Collections.IList] -and $principalScopes.Count -gt 0) {
-                $primaryQuery = Get-DictValue $principalScopes[0] 'query'
-            }
-        }
-
-        $scopeDataKeys = if ($scopeData -is [System.Collections.IDictionary]) { $scopeData.Keys -join ', ' } else { $scopeData.PSObject.Properties.Name -join ', ' }
-        if (-not $primaryQuery) {
-            throw "Could not extract primary query from old definition scope. Scope keys: $scopeDataKeys"
-        }
-
-        # Build simple accessReviewQueryScope (Option A)
-        $scopeHt = @{
-            '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
-            'queryType'   = $queryType
-            'query'       = normalizeGraphPathVersion $primaryQuery
-        }
+        Write-Host "Using scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
 
         $reviewersArr = @(convertReviewerScopesToArray $old.Reviewers)
 
@@ -396,54 +613,33 @@ function processAccessReviewDefinition {
             throw "No valid reviewers found after conversion (Graph requires reviewers with query/queryType)."
         }
 
-        # Settings: copy a safe subset, then override recurrence + duration
-        $settings = $old.Settings
-        $settingsHt = @{}
-
-        foreach ($k in @(
-                'mailNotificationsEnabled',
-                'reminderNotificationsEnabled',
-                'justificationRequiredOnApproval',
-                'defaultDecisionEnabled',
-                'defaultDecision',
-                'recommendationsEnabled',
-                'autoApplyDecisionsEnabled',
-                'accessRecommendationsEnabled',
-                'decisionHistoriesForReviewersEnabled'
-            )) {
-            if ($settings -and $settings.PSObject.Properties[$k]) { $settingsHt[$k] = $settings.$k }
-        }
+        # Build settings with proper structure (includes recurrence and instanceDurationInDays)
+        $settingsHt = buildSettingsObject -oldSettings $old.Settings -StartDate $StartDate -InstanceDurationInDays $InstanceDurationInDays
 
         # Build the body for the new definition
+        # Based on MS documentation: recurrence and instanceDurationInDays go INSIDE settings
         $body = @{
             displayName             = $old.DisplayName + $NewDisplayNameSuffix
-            descriptionForAdmins    = $old.DescriptionForAdmins
-            descriptionForReviewers = $old.DescriptionForReviewers
+            descriptionForAdmins    = if ($old.DescriptionForAdmins) { $old.DescriptionForAdmins } else { "Cloned from $DefinitionId on $(Get-Date -Format 'yyyy-MM-dd')" }
+            descriptionForReviewers = if ($old.DescriptionForReviewers) { $old.DescriptionForReviewers } else { "Please review your access." }
             scope                   = $scopeHt
             reviewers               = $reviewersArr
             settings                = $settingsHt
-            recurrence              = buildOneTimeRecurrence $StartDate
-            instanceDurationInDays  = $InstanceDurationInDays
         }
-        
+
         # Add fallbackReviewers if they exist
         $fallbackReviewersArr = @(convertReviewerScopesToArray $old.FallbackReviewers)
         if ($fallbackReviewersArr.Count -gt 0) {
             $body['fallbackReviewers'] = $fallbackReviewersArr
         }
 
-        # Ensure required descriptions
-        if (-not $body.descriptionForAdmins -or [string]::IsNullOrWhiteSpace($body.descriptionForAdmins)) {
-            $body.descriptionForAdmins = "Cloned from $OldDefinitionId on $(Get-Date -Format 'yyyy-MM-dd')"
-        }
-        if (-not $body.descriptionForReviewers -or [string]::IsNullOrWhiteSpace($body.descriptionForReviewers)) {
-            $body.descriptionForReviewers = "Please review your access."
-        }
-
         removeNullsRecursively -obj $body
 
-        Write-Host "`n--- Payload to Graph ---"
-        $body | ConvertTo-Json -Depth 100 | Write-Host
+        # Display body if requested
+        if ($ShowBody) {
+            Write-Host "`n--- Payload to Graph ---"
+            $body | ConvertTo-Json -Depth 100 | Write-Host
+        }
 
         if ($IsWhatIf) {
             Write-Host "`n[WHATIF] Would create Access Review Definition with the payload shown above" -ForegroundColor Yellow
@@ -451,27 +647,129 @@ function processAccessReviewDefinition {
         }
 
         try {
-            $newDef = New-MgIdentityGovernanceAccessReviewDefinition -BodyParameter $body
+            $newDef = New-MgIdentityGovernanceAccessReviewDefinition -BodyParameter $body -ErrorAction Stop
             Write-Host "`nCreated Access Review Definition Id: $($newDef.Id)" -ForegroundColor Green
+
+            # Save output log for successful creation (unless suppressed)
+            if (-not $SuppressLogs) {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage "" -ErrorDetails "" -ProblematicSettings $problematicSettings `
+                    -IsSuccess $true -PromptUser $false
+            }
+
             return $newDef
         } catch {
-            Write-Host "`nCreation failed." -ForegroundColor Red
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                Write-Host "`n--- ErrorDetails.Message ---" -ForegroundColor Red
-                Write-Host $_.ErrorDetails.Message
+            Write-Host "`n========================================" -ForegroundColor Red
+            Write-Host "ERROR: Creation Failed" -ForegroundColor Red
+            Write-Host "========================================" -ForegroundColor Red
+
+            $errorMsg = $_.Exception.Message
+            $errorDetails = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { "" }
+
+            Write-Host "`nError Message:" -ForegroundColor Red
+            Write-Host $errorMsg
+
+            if ($errorDetails) {
+                Write-Host "`nError Details:" -ForegroundColor Red
+                Write-Host $errorDetails
             }
-            Write-Host "`n--- Exception ---" -ForegroundColor Red
-            Write-Host $_.Exception.Message
-            throw
+
+            Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
+
+            # Save output log (prompt only if suppressed)
+            if ($SuppressLogs) {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
+                    -IsSuccess $false -PromptUser $true
+            } else {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
+                    -IsSuccess $false -PromptUser $false
+            }
+
+            Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
+            return $null
         }
     } catch {
-        Write-Host "Failed to process definition $DefinitionId : $_" -ForegroundColor Red
-        throw
+        Write-Host "`n========================================" -ForegroundColor Red
+        Write-Host "ERROR: Failed to Process Definition" -ForegroundColor Red
+        Write-Host "========================================" -ForegroundColor Red
+        Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
+        Write-Host "`nError: $_" -ForegroundColor Red
+
+        # Save output log (prompt only if suppressed)
+        if ($SuppressLogs) {
+            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+                -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
+                -IsSuccess $false -PromptUser $true
+        } else {
+            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+                -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
+                -IsSuccess $false -PromptUser $false
+        }
+
+        Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
+        return $null
     }
 }
 
 # ---------------- Connect & load ----------------
 Import-Module Microsoft.Graph.Identity.Governance -ErrorAction Stop
+
+# If DumpDefinition mode, connect and dump, then exit
+if ($DumpDefinition.IsPresent) {
+    if (-not (Get-MgContext)) {
+        Connect-MgGraph -Scopes "AccessReview.Read.All"
+    }
+
+    foreach ($defId in $DefinitionIds) {
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "Definition ID: $defId" -ForegroundColor Cyan
+        Write-Host "========================================`n" -ForegroundColor Cyan
+
+        try {
+            $definition = Get-MgIdentityGovernanceAccessReviewDefinition -AccessReviewScheduleDefinitionId $defId
+
+            # Fully convert the definition object to a hashtable with all nested objects expanded
+            $convertedDef = @{
+                Id                               = $definition.Id
+                DisplayName                      = $definition.DisplayName
+                DescriptionForAdmins             = $definition.DescriptionForAdmins
+                DescriptionForReviewers          = $definition.DescriptionForReviewers
+                CreatedDateTime                  = if ($definition.CreatedDateTime) { $definition.CreatedDateTime.ToString('o') } else { $null }
+                LastModifiedDateTime             = if ($definition.LastModifiedDateTime) { $definition.LastModifiedDateTime.ToString('o') } else { $null }
+                Status                           = $definition.Status
+                InstanceDurationInDays           = $definition.InstanceDurationInDays
+                Scope                            = unwrapGraphObject $definition.Scope
+                Reviewers                        = @(convertReviewerScopesToArray $definition.Reviewers)
+                FallbackReviewers                = @(convertReviewerScopesToArray $definition.FallbackReviewers)
+                Settings                         = unwrapGraphObject $definition.Settings
+                InstanceEnumerationScope         = unwrapGraphObject $definition.InstanceEnumerationScope
+                Recurrence                       = unwrapGraphObject $definition.Recurrence
+                AdditionalNotificationRecipients = @(convertAdditionalRecipientsToArray $definition.AdditionalNotificationRecipients)
+            }
+
+            # Remove null values
+            removeNullsRecursively -obj $convertedDef
+
+            # Convert to JSON with full depth for complete text representation
+            $jsonOutput = $convertedDef | ConvertTo-Json -Depth 100
+            Write-Host $jsonOutput
+            Write-Host ""
+
+        } catch {
+            Write-Host "Failed to dump definition $defId : $_" -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+    }
+
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "Dump complete." -ForegroundColor Cyan
+    Write-Host "========================================`n" -ForegroundColor Cyan
+    exit 0
+}
+
+# Connect for normal processing
 if (-not (Get-MgContext)) {
     Connect-MgGraph -Scopes "AccessReview.ReadWrite.All"
 }
@@ -485,7 +783,9 @@ foreach ($defId in $DefinitionIds) {
         -StartDate $StartDate `
         -InstanceDurationInDays $InstanceDurationInDays `
         -NewDisplayNameSuffix $NewDisplayNameSuffix `
-        -IsWhatIf $WhatIf.IsPresent
+        -IsWhatIf $WhatIf.IsPresent `
+        -SuppressLogs $SuppressOutputLogs.IsPresent `
+        -ShowBody $DisplayBody.IsPresent
     if ($result) {
         $results += $result
     }
