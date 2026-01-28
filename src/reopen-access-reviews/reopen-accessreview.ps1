@@ -9,7 +9,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 15:09
+Last Modified: 2026-01-28 16:18
 Fixed: Settings structure, scope handling, description defaults, tenant compatibility
 #>
 
@@ -404,7 +404,6 @@ function buildSettingsObject {
     )
 
     # Build settings with only essential, safe properties
-    # Avoids problematic settings like recommendationLookBackDuration, recommendationInsightSettings
     $settingsHt = @{
         # Core notification settings
         'mailNotificationsEnabled'        = if ($oldSettings.PSObject.Properties['MailNotificationsEnabled']) { $oldSettings.MailNotificationsEnabled } else { $true }
@@ -426,6 +425,21 @@ function buildSettingsObject {
         # Scheduling - set by us for one-time review
         'instanceDurationInDays'          = $InstanceDurationInDays
         'recurrence'                      = buildOneTimeRecurrence $StartDate
+    }
+
+    # Handle recommendationLookBackDuration - extract days and create ISO 8601 duration
+    if ($oldSettings.PSObject.Properties['RecommendationLookBackDuration']) {
+        $lookback = $oldSettings.RecommendationLookBackDuration
+        if ($lookback) {
+            # Try to convert to ISO 8601 duration string using just the days
+            $durationStr = toIso8601Duration $lookback
+            if ($durationStr) {
+                $settingsHt['recommendationLookBackDuration'] = $durationStr
+                Write-Host "  Including recommendationLookBackDuration: $durationStr" -ForegroundColor Cyan
+            } else {
+                Write-Host "  Warning: recommendationLookBackDuration exists but could not be converted - excluding from new definition" -ForegroundColor Yellow
+            }
+        }
     }
 
     # Copy applyActions if present AND non-empty (actions to apply on denied guest users)
@@ -499,13 +513,7 @@ function Test-ProblematicSettings {
     $problematicSettings = @()
 
     # Check for problematic settings that were removed in simplified implementation
-    if ($Settings.PSObject.Properties['RecommendationLookBackDuration']) {
-        $value = $Settings.RecommendationLookBackDuration
-        # Only warn if it has actual data (not empty/null)
-        if ($value -and ($value.PSObject.Properties.Count -gt 0 -or $value -is [timespan])) {
-            $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
-        }
-    }
+    # Note: recommendationLookBackDuration is now handled properly by extracting days
 
     if ($Settings.PSObject.Properties['RecommendationInsightSettings']) {
         $value = $Settings.RecommendationInsightSettings
@@ -513,23 +521,38 @@ function Test-ProblematicSettings {
         if ($value -and $value.Count -gt 0) {
             $hasNonEmptyItems = $false
             foreach ($item in $value) {
-                # Check if item has properties beyond just AdditionalProperties
-                # or if AdditionalProperties itself has content
-                $propCount = $item.PSObject.Properties.Count
-                if ($propCount -eq 0) {
-                    # Truly empty object
+                # Skip null items
+                if (-not $item) { continue }
+
+                # Check if item is a hashtable/dictionary with no keys
+                if ($item -is [System.Collections.IDictionary] -and $item.Keys.Count -eq 0) {
                     continue
-                } elseif ($propCount -eq 1 -and $item.PSObject.Properties.Name -contains 'AdditionalProperties') {
-                    # Only has AdditionalProperties - check if that's empty
-                    if ($item.AdditionalProperties -and $item.AdditionalProperties.Count -gt 0) {
-                        $hasNonEmptyItems = $true
-                        break
-                    }
-                } else {
-                    # Has other properties besides AdditionalProperties
-                    $hasNonEmptyItems = $true
-                    break
                 }
+
+                # For Graph SDK objects, check if they're effectively empty
+                $props = $item.PSObject.Properties | Where-Object { $_.Name -ne 'AdditionalProperties' }
+                if ($props.Count -eq 0) {
+                    # No properties besides AdditionalProperties
+                    if ($item.PSObject.Properties['AdditionalProperties']) {
+                        $additionalProps = $item.AdditionalProperties
+                        # Check if AdditionalProperties is empty or only has OData metadata
+                        if (-not $additionalProps -or $additionalProps.Keys.Count -eq 0) {
+                            continue
+                        }
+                        # Check if only has @odata.type property (which is just metadata)
+                        $nonODataKeys = @($additionalProps.Keys | Where-Object { -not $_.StartsWith('@odata.') })
+                        if ($nonODataKeys.Count -eq 0) {
+                            continue
+                        }
+                    } else {
+                        # No properties at all
+                        continue
+                    }
+                }
+
+                # If we get here, the item has actual data
+                $hasNonEmptyItems = $true
+                break
             }
             if ($hasNonEmptyItems) {
                 $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
@@ -613,7 +636,8 @@ function Save-OutputLog {
             $outputData['Invocation']['ErrorDetails'] = $ErrorDetails
         }
 
-        $outputData['OriginalDefinition'] = $Definition
+        # Properly unwrap the Graph SDK object to include all AdditionalProperties
+        $outputData['OriginalDefinition'] = unwrapGraphObject $Definition
         $outputData['Body'] = $Body
 
         $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
@@ -736,6 +760,16 @@ function processAccessReviewDefinition {
         if ($ShowBody) {
             Write-Host "`n--- Payload to Graph ---"
             $body | ConvertTo-Json -Depth 100 | Write-Host
+        }
+
+        # Always show scope details for debugging
+        if ($body.ContainsKey('scope')) {
+            Write-Host "`nScope being sent to API:" -ForegroundColor Magenta
+            Write-Host "  @odata.type: $($body.scope.'@odata.type')" -ForegroundColor Magenta
+            Write-Host "  Keys: $($body.scope.Keys -join ', ')" -ForegroundColor Magenta
+            if ($body.scope.ContainsKey('query')) {
+                Write-Host "  query: $($body.scope.query)" -ForegroundColor Magenta
+            }
         }
 
         if ($IsWhatIf) {
