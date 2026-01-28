@@ -8,14 +8,14 @@ folders have been updated since a specified date.
 
 Usage:
     python find-updated-files.py
-    
+
     The script will prompt for:
     - Root directory to scan
     - Output CSV filename
-    
+
 Output:
     CSV file with columns: Folder Name, Last Modified, File
-    
+
 Modified: auto-updated by pre-commit hook
 """
 
@@ -27,16 +27,16 @@ import unicodedata
 def searchFiles(rootDirectory, modifyDateLimit, excludedFiles):
     """
     Recursively search directories for the most recently modified file.
-    
+
     Scans the root directory and its subdirectories to find files modified
     after the specified date. For each top-level folder, outputs the most
     recently modified file and its modification date.
-    
+
     Args:
         rootDirectory (str): The root directory to start searching from
         modifyDateLimit (time.struct_time): The date threshold for modifications
         excludedFiles (list): List of filenames to skip during the search
-        
+
     Returns:
         None (outputs results to file and stdout)
     """
