@@ -9,8 +9,8 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 16:18
-Fixed: Settings structure, scope handling, description defaults, tenant compatibility
+Last Modified: 2026-01-28 16:38
+Fixed: Strip query complexity (transitiveMembers/type filters) to avoid "Custom Scoping Conditions" error
 #>
 
 param(
@@ -458,7 +458,7 @@ function buildSettingsObject {
 }
 
 # ---------------- Scope Simplification ----------------
-function Simplify-Scope {
+function ConvertTo-SimpleScope {
     param(
         [hashtable]$ScopeHt
     )
@@ -469,8 +469,32 @@ function Simplify-Scope {
         return $null
     }
 
-    # If it's already a simple scope, return as-is
+    # Strip out complex filtering from queries (transitiveMembers, microsoft.graph.user, etc.)
+    # Some tenants don't support these "Custom Scoping Conditions"
+    function Strip-QueryComplexity {
+        param([string]$query)
+
+        if (-not $query) { return $query }
+
+        # If the query contains /transitiveMembers or /members with filters, simplify to just the group
+        # Examples:
+        #   /v1.0/groups/{id}/transitiveMembers/microsoft.graph.user -> /v1.0/groups/{id}/members
+        #   /v1.0/groups/{id}/members/microsoft.graph.user -> /v1.0/groups/{id}/members
+        if ($query -match '(/v1\.0/groups/[^/]+)/(transitiveMembers|members)(/microsoft\.graph\.\w+)?') {
+            $groupPath = $Matches[1]
+            $simplifiedQuery = "$groupPath/members"
+            Write-Host "  Stripped query complexity: $query -> $simplifiedQuery" -ForegroundColor Yellow
+            return $simplifiedQuery
+        }
+
+        return $query
+    }
+
+    # If it's already a simple scope, strip complexity and return
     if ($ScopeHt.'@odata.type' -eq '#microsoft.graph.accessReviewQueryScope') {
+        if ($ScopeHt.ContainsKey('query')) {
+            $ScopeHt['query'] = Strip-QueryComplexity -query $ScopeHt['query']
+        }
         return $ScopeHt
     }
 
@@ -482,9 +506,12 @@ function Simplify-Scope {
         if ($ScopeHt.ContainsKey('resourceScopes') -and $ScopeHt['resourceScopes'] -and $ScopeHt['resourceScopes'].Count -gt 0) {
             $firstResource = $ScopeHt['resourceScopes'][0]
 
+            $originalQuery = $firstResource['query']
+            $simplifiedQuery = Strip-QueryComplexity -query $originalQuery
+
             $simplifiedScope = @{
                 '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
-                'query'       = $firstResource['query']
+                'query'       = $simplifiedQuery
                 'queryType'   = $firstResource['queryType']
             }
 
@@ -568,7 +595,7 @@ function Test-ProblematicSettings {
 }
 
 # ---------------- Output log generation ----------------
-function Save-OutputLog {
+function Export-OutputLog {
     param(
         [string]$DefinitionId,
         [object]$Definition,
@@ -718,7 +745,7 @@ function processAccessReviewDefinition {
             Write-Host "Using scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
 
             # Always simplify scope to ensure tenant compatibility
-            $scopeHt = Simplify-Scope -ScopeHt $scopeHt
+            $scopeHt = ConvertTo-SimpleScope -ScopeHt $scopeHt
             if ($scopeHt) {
                 Write-Host "Final scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
             }
@@ -783,7 +810,7 @@ function processAccessReviewDefinition {
 
             # Save output log for successful creation (unless suppressed)
             if (-not $SuppressLogs) {
-                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                Export-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
                     -ErrorMessage "" -ErrorDetails "" -ProblematicSettings $problematicSettings `
                     -IsSuccess $true -PromptUser $false
             }
@@ -815,11 +842,11 @@ function processAccessReviewDefinition {
 
             # Save output log (prompt only if suppressed)
             if ($SuppressLogs) {
-                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                Export-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
                     -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
                     -IsSuccess $false -PromptUser $true
             } else {
-                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                Export-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
                     -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
                     -IsSuccess $false -PromptUser $false
             }
@@ -836,11 +863,11 @@ function processAccessReviewDefinition {
 
         # Save output log (prompt only if suppressed)
         if ($SuppressLogs) {
-            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+            Export-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
                 -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
                 -IsSuccess $false -PromptUser $true
         } else {
-            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+            Export-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
                 -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
                 -IsSuccess $false -PromptUser $false
         }
