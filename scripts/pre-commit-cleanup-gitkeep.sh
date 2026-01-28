@@ -13,6 +13,8 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
 }
 
 # Function to update Last Modified date in scripts
+# This function updates the timestamp regardless of whether the changes
+# are comment-only or include code modifications
 update_last_modified() {
     local file="$1"
     local current_date

@@ -9,7 +9,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 12:50
+Last Modified: 2026-01-28 13:35
 Fixed: Settings structure, scope handling, description defaults
 #>
 
@@ -24,7 +24,7 @@ param(
     [datetime] $StartDate = (Get-Date),   # default: today
 
     [Parameter(Mandatory = $false)]
-    [int] $InstanceDurationInDays = 7,    # default: one week open
+    [int] $InstanceDurationInDays = 30,    # default: 30 days open
 
     [Parameter(Mandatory = $false)]
     [string] $NewDisplayNameSuffix = " - Reopened (One-time)",
@@ -33,10 +33,37 @@ param(
     [switch] $WhatIf,
 
     [Parameter(Mandatory = $false)]
-    [switch] $DumpDefinition
+    [switch] $DumpDefinition,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $SuppressOutputLogs,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DisplayBody
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---------------- Script Metadata ----------------
+$ScriptName = Split-Path -Leaf $PSCommandPath
+$LastModifiedDate = "Unknown"
+
+# Extract Last Modified date from header
+try {
+    $headerContent = Get-Content $PSCommandPath -First 20 -ErrorAction SilentlyContinue
+    $lastModifiedLine = $headerContent | Where-Object { $_ -match 'Last Modified:\s*(.+)' } | Select-Object -First 1
+    if ($lastModifiedLine -and $Matches[1]) {
+        $LastModifiedDate = $Matches[1].Trim()
+    }
+} catch {
+    # If we can't read the file, just use Unknown
+}
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Script: $ScriptName" -ForegroundColor Cyan
+Write-Host "Last Modified: $LastModifiedDate" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
 
 # Build list of IDs to process
 $DefinitionIds = @()
@@ -376,84 +403,145 @@ function buildSettingsObject {
         [int]$InstanceDurationInDays
     )
 
-    # Start with a safe subset of settings from the old definition
-    $settingsHt = @{}
+    # Build settings with only essential, safe properties
+    # Avoids problematic settings like recommendationLookBackDuration, recommendationInsightSettings
+    $settingsHt = @{
+        # Core notification settings
+        'mailNotificationsEnabled'        = if ($oldSettings.PSObject.Properties['MailNotificationsEnabled']) { $oldSettings.MailNotificationsEnabled } else { $true }
+        'reminderNotificationsEnabled'    = if ($oldSettings.PSObject.Properties['ReminderNotificationsEnabled']) { $oldSettings.ReminderNotificationsEnabled } else { $true }
 
-    foreach ($k in @(
-            'mailNotificationsEnabled',
-            'reminderNotificationsEnabled',
-            'justificationRequiredOnApproval',
-            'defaultDecisionEnabled',
-            'defaultDecision',
-            'recommendationsEnabled',
-            'autoApplyDecisionsEnabled',
-            'accessRecommendationsEnabled',
-            'decisionHistoriesForReviewersEnabled'
-        )) {
-        if ($oldSettings -and $oldSettings.PSObject.Properties[$k]) {
-            $settingsHt[$k] = $oldSettings.$k
-        }
+        # Approval requirements
+        'justificationRequiredOnApproval' = if ($oldSettings.PSObject.Properties['JustificationRequiredOnApproval']) { $oldSettings.JustificationRequiredOnApproval } else { $true }
+
+        # For one-time reviews, disable recommendations to avoid complex insight settings
+        'recommendationsEnabled'          = $false
+
+        # Default decision when reviewers don't respond
+        'defaultDecisionEnabled'          = if ($oldSettings.PSObject.Properties['DefaultDecisionEnabled']) { $oldSettings.DefaultDecisionEnabled } else { $false }
+        'defaultDecision'                 = if ($oldSettings.PSObject.Properties['DefaultDecision']) { $oldSettings.DefaultDecision } else { 'None' }
+
+        # Auto-apply decisions to resource
+        'autoApplyDecisionsEnabled'       = if ($oldSettings.PSObject.Properties['AutoApplyDecisionsEnabled']) { $oldSettings.AutoApplyDecisionsEnabled } else { $false }
+
+        # Scheduling - set by us for one-time review
+        'instanceDurationInDays'          = $InstanceDurationInDays
+        'recurrence'                      = buildOneTimeRecurrence $StartDate
     }
 
-    # Set the instance duration and recurrence at the settings level
-    $settingsHt['instanceDurationInDays'] = $InstanceDurationInDays
-    $settingsHt['recurrence'] = buildOneTimeRecurrence $StartDate
+    # Copy applyActions if present AND non-empty (actions to apply on denied guest users)
+    if ($oldSettings.PSObject.Properties['ApplyActions']) {
+        $actions = unwrapGraphObject $oldSettings.ApplyActions
+        # Filter out empty objects that cause validation errors
+        $validActions = @($actions | Where-Object {
+                $_ -and ($_ -is [System.Collections.IDictionary]) -and $_.Keys.Count -gt 0
+            })
+        if ($validActions.Count -gt 0) {
+            $settingsHt['applyActions'] = $validActions
+        }
+    }
 
     return $settingsHt
 }
 
-# ---------------- Debug file generation ----------------
-function Prompt-GenerateDebugFile {
+# ---------------- Problematic Settings Detection ----------------
+function Test-ProblematicSettings {
+    param(
+        [object]$Settings
+    )
+
+    $problematicSettings = @()
+
+    # Check for problematic settings that were removed in simplified implementation
+    if ($Settings.PSObject.Properties['RecommendationLookBackDuration']) {
+        $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+    }
+
+    if ($Settings.PSObject.Properties['RecommendationInsightSettings']) {
+        $value = $Settings.RecommendationInsightSettings
+        if ($value) {
+            $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+        }
+    }
+
+    if ($Settings.PSObject.Properties['AccessRecommendationsEnabled']) {
+        $problematicSettings += "accessRecommendationsEnabled (not supported in v1.0 API)"
+    }
+
+    return $problematicSettings
+}
+
+# ---------------- Output log generation ----------------
+function Save-OutputLog {
     param(
         [string]$DefinitionId,
         [object]$Definition,
         [object]$Body,
         [string]$ErrorMessage,
-        [string]$ErrorDetails
+        [string]$ErrorDetails,
+        [string[]]$ProblematicSettings,
+        [bool]$IsSuccess = $false,
+        [bool]$PromptUser = $false
     )
 
-    Write-Host "`n" -NoNewline
-    Write-Host "Would you like to generate a debug file for the developer? [Y/n] (Auto-yes in 5 seconds): " -ForegroundColor Yellow -NoNewline
+    $shouldGenerate = $true
 
-    $timeout = 5
-    $startTime = Get-Date
-    $response = $null
+    # If prompting is required (logs were suppressed and error occurred)
+    if ($PromptUser) {
+        Write-Host "`n" -NoNewline
+        Write-Host "Would you like to generate an output log for troubleshooting? [Y/n] (Auto-yes in 5 seconds): " -ForegroundColor Yellow -NoNewline
 
-    while (((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true)
-            $response = $key.KeyChar.ToString().ToLower()
-            break
+        $timeout = 5
+        $startTime = Get-Date
+        $response = $null
+
+        while (((Get-Date) - $startTime).TotalSeconds -lt $timeout) {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                $response = $key.KeyChar.ToString().ToLower()
+                break
+            }
+            Start-Sleep -Milliseconds 100
         }
-        Start-Sleep -Milliseconds 100
+
+        if ($response -eq 'n') {
+            Write-Host "No"
+            $shouldGenerate = $false
+        } else {
+            Write-Host "Yes"
+        }
     }
 
-    if ($null -eq $response -or $response -eq '' -or $response -eq 'y') {
-        Write-Host "Yes"
-
+    if ($shouldGenerate) {
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $debugFileName = "debug-accessreview-$DefinitionId-$timestamp.json"
+        $outputFileName = "output-accessreview-$DefinitionId-$timestamp.json"
 
-        $debugData = @{
-            Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            DefinitionId = $DefinitionId
-            Definition   = $Definition
-            RequestBody  = $Body
-            Error        = @{
-                Message = $ErrorMessage
-                Details = $ErrorDetails
-            }
+        $outputData = @{
+            ScriptName         = $ScriptName
+            ScriptLastModified = $LastModifiedDate
+            Timestamp          = $timestamp
+            DefinitionId       = $DefinitionId
+            Success            = $IsSuccess
         }
 
-        try {
-            $debugData | ConvertTo-Json -Depth 100 | Out-File -FilePath $debugFileName -Encoding UTF8
-            Write-Host "Debug file created: $debugFileName" -ForegroundColor Green
-        } catch {
-            Write-Host "Failed to create debug file: $_" -ForegroundColor Red
+        if ($ProblematicSettings -and $ProblematicSettings.Count -gt 0) {
+            $outputData['ProblematicSettingsDetected'] = $ProblematicSettings
         }
-    } else {
-        Write-Host "No"
-        Write-Host "Debug file generation skipped." -ForegroundColor Yellow
+
+        if (-not $IsSuccess) {
+            $outputData['ErrorMessage'] = $ErrorMessage
+            $outputData['ErrorDetails'] = $ErrorDetails
+        }
+
+        $outputData['OriginalDefinition'] = $Definition
+        $outputData['AttemptedBody'] = $Body
+
+        $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
+
+        if ($PromptUser) {
+            Write-Host "`nOutput log saved: $outputFileName" -ForegroundColor Green
+        } else {
+            Write-Host "Output log saved: $outputFileName" -ForegroundColor Cyan
+        }
     }
 }
 
@@ -464,7 +552,9 @@ function processAccessReviewDefinition {
         [datetime]$StartDate,
         [int]$InstanceDurationInDays,
         [string]$NewDisplayNameSuffix,
-        [bool]$IsWhatIf
+        [bool]$IsWhatIf,
+        [bool]$SuppressLogs,
+        [bool]$ShowBody
     )
 
     Write-Host "`n========================================"
@@ -473,6 +563,22 @@ function processAccessReviewDefinition {
 
     try {
         $old = Get-MgIdentityGovernanceAccessReviewDefinition -AccessReviewScheduleDefinitionId $DefinitionId
+
+        Write-Host "Source Definition: $($old.DisplayName)" -ForegroundColor White
+
+        # Check for problematic settings
+        $problematicSettings = @()
+        if ($old.Settings) {
+            $problematicSettings = Test-ProblematicSettings -Settings $old.Settings
+            if ($problematicSettings.Count -gt 0) {
+                Write-Host "`n[WARNING] Detected problematic settings in source definition:" -ForegroundColor Yellow
+                foreach ($setting in $problematicSettings) {
+                    Write-Host "  - $setting" -ForegroundColor Yellow
+                }
+                Write-Host "These settings will NOT be copied to the new definition." -ForegroundColor Yellow
+                Write-Host "See output log for details.`n" -ForegroundColor Yellow
+            }
+        }
 
         # ---------------- Build new payload ----------------
         # Unwrap SDK object - actual scope data is in AdditionalProperties
@@ -529,8 +635,11 @@ function processAccessReviewDefinition {
 
         removeNullsRecursively -obj $body
 
-        Write-Host "`n--- Payload to Graph ---"
-        $body | ConvertTo-Json -Depth 100 | Write-Host
+        # Display body if requested
+        if ($ShowBody) {
+            Write-Host "`n--- Payload to Graph ---"
+            $body | ConvertTo-Json -Depth 100 | Write-Host
+        }
 
         if ($IsWhatIf) {
             Write-Host "`n[WHATIF] Would create Access Review Definition with the payload shown above" -ForegroundColor Yellow
@@ -540,6 +649,14 @@ function processAccessReviewDefinition {
         try {
             $newDef = New-MgIdentityGovernanceAccessReviewDefinition -BodyParameter $body -ErrorAction Stop
             Write-Host "`nCreated Access Review Definition Id: $($newDef.Id)" -ForegroundColor Green
+
+            # Save output log for successful creation (unless suppressed)
+            if (-not $SuppressLogs) {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage "" -ErrorDetails "" -ProblematicSettings $problematicSettings `
+                    -IsSuccess $true -PromptUser $false
+            }
+
             return $newDef
         } catch {
             Write-Host "`n========================================" -ForegroundColor Red
@@ -559,8 +676,16 @@ function processAccessReviewDefinition {
 
             Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
 
-            # Prompt for debug file generation
-            Prompt-GenerateDebugFile -DefinitionId $DefinitionId -Definition $old -Body $body -ErrorMessage $errorMsg -ErrorDetails $errorDetails
+            # Save output log (prompt only if suppressed)
+            if ($SuppressLogs) {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
+                    -IsSuccess $false -PromptUser $true
+            } else {
+                Save-OutputLog -DefinitionId $DefinitionId -Definition $old -Body $body `
+                    -ErrorMessage $errorMsg -ErrorDetails $errorDetails -ProblematicSettings $problematicSettings `
+                    -IsSuccess $false -PromptUser $false
+            }
 
             Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
             return $null
@@ -572,8 +697,16 @@ function processAccessReviewDefinition {
         Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
         Write-Host "`nError: $_" -ForegroundColor Red
 
-        # Prompt for debug file generation
-        Prompt-GenerateDebugFile -DefinitionId $DefinitionId -Definition $null -Body $null -ErrorMessage $_.Exception.Message -ErrorDetails ""
+        # Save output log (prompt only if suppressed)
+        if ($SuppressLogs) {
+            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+                -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
+                -IsSuccess $false -PromptUser $true
+        } else {
+            Save-OutputLog -DefinitionId $DefinitionId -Definition $null -Body $null `
+                -ErrorMessage $_.Exception.Message -ErrorDetails "" -ProblematicSettings @() `
+                -IsSuccess $false -PromptUser $false
+        }
 
         Write-Host "`nSkipping this definition and continuing..." -ForegroundColor Yellow
         return $null
@@ -650,7 +783,9 @@ foreach ($defId in $DefinitionIds) {
         -StartDate $StartDate `
         -InstanceDurationInDays $InstanceDurationInDays `
         -NewDisplayNameSuffix $NewDisplayNameSuffix `
-        -IsWhatIf $WhatIf.IsPresent
+        -IsWhatIf $WhatIf.IsPresent `
+        -SuppressLogs $SuppressOutputLogs.IsPresent `
+        -ShowBody $DisplayBody.IsPresent
     if ($result) {
         $results += $result
     }
