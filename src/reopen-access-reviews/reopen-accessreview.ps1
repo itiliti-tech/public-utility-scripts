@@ -6,7 +6,7 @@ Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 12:23
+Last Modified: 2026-01-28 12:28
 #>
 
 param(
@@ -331,7 +331,6 @@ function processAccessReviewDefinition {
         # Extract the primary query from the old scope
         $oldScope = $old.Scope
         $primaryQuery = $null
-        $queryType = "MicrosoftGraph"
 
         # Unwrap SDK object - actual scope data is in AdditionalProperties
         if ($oldScope.PSObject.Properties['AdditionalProperties'] -and $oldScope.AdditionalProperties) {
@@ -389,9 +388,9 @@ function processAccessReviewDefinition {
         }
 
         # Build simple accessReviewQueryScope (Option A)
+        # Note: Do NOT include queryType for basic scopes - it triggers custom scoping validation
         $scopeHt = @{
             '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
-            'queryType'   = $queryType
             'query'       = normalizeGraphPathVersion $primaryQuery
         }
 
