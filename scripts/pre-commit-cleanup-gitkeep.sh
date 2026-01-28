@@ -20,8 +20,8 @@ update_last_modified() {
     local current_date
     current_date=$(date '+%Y-%m-%d %H:%M')
 
-    # Check if file contains "Last Modified:" pattern
-    if grep -q "Last Modified:" "$file"; then
+    # Check if file contains "Last Modified:" pattern in the first 30 lines (header area)
+    if head -n 30 "$file" | grep -q "Last Modified:"; then
         echo "Updating Last Modified date in: $file"
 
         # Create temporary file for in-place editing
