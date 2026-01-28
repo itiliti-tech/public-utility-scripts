@@ -1,16 +1,16 @@
 <#
 Clone an existing Access Review schedule definition by ID and create a NEW one-time definition
-that starts today (or StartDate) and stays open for 7 days (or InstanceDurationInDays).
+that starts today (or StartDate) and stays open for 30 days (or InstanceDurationInDays).
 
-Supports both simple accessReviewQueryScope and complex principalResourceMembershipsScope
-with multiple principal and resource scopes (including B2B direct connect users and shared channels).
+Automatically simplifies complex principalResourceMembershipsScope to basic accessReviewQueryScope
+for maximum tenant compatibility. Supports both simple and complex source definitions.
 
 Requires:
 - Microsoft.Graph.Identity.Governance
 - AccessReview.ReadWrite.All
 
-Last Modified: 2026-01-28 13:45
-Fixed: Settings structure, scope handling, description defaults
+Last Modified: 2026-01-28 15:09
+Fixed: Settings structure, scope handling, description defaults, tenant compatibility
 #>
 
 param(
@@ -443,6 +443,53 @@ function buildSettingsObject {
     return $settingsHt
 }
 
+# ---------------- Scope Simplification ----------------
+function Simplify-Scope {
+    param(
+        [hashtable]$ScopeHt
+    )
+
+    # If scope is empty or null, return null (don't create a default)
+    if (-not $ScopeHt -or $ScopeHt.Keys.Count -eq 0) {
+        Write-Host "Scope is empty - will not be included in new definition" -ForegroundColor Yellow
+        return $null
+    }
+
+    # If it's already a simple scope, return as-is
+    if ($ScopeHt.'@odata.type' -eq '#microsoft.graph.accessReviewQueryScope') {
+        return $ScopeHt
+    }
+
+    # If it's a principalResourceMembershipsScope, convert to simple scope
+    if ($ScopeHt.'@odata.type' -eq '#microsoft.graph.principalResourceMembershipsScope') {
+        Write-Host "Simplifying principalResourceMembershipsScope to basic accessReviewQueryScope" -ForegroundColor Yellow
+
+        # Use the first resourceScope as the base scope
+        if ($ScopeHt.ContainsKey('resourceScopes') -and $ScopeHt['resourceScopes'] -and $ScopeHt['resourceScopes'].Count -gt 0) {
+            $firstResource = $ScopeHt['resourceScopes'][0]
+
+            $simplifiedScope = @{
+                '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
+                'query'       = $firstResource['query']
+                'queryType'   = $firstResource['queryType']
+            }
+
+            if ($ScopeHt['resourceScopes'].Count -gt 1) {
+                Write-Host "  Note: Original scope had $($ScopeHt['resourceScopes'].Count) resource scopes. Using first scope only." -ForegroundColor Yellow
+            }
+
+            Write-Host "  Simplified query: $($simplifiedScope['query'])" -ForegroundColor Cyan
+            return $simplifiedScope
+        } else {
+            Write-Host "  Warning: principalResourceMembershipsScope has no resourceScopes. Scope will be omitted." -ForegroundColor Yellow
+            return $null
+        }
+    }
+
+    # Return as-is if we don't know how to simplify
+    return $ScopeHt
+}
+
 # ---------------- Problematic Settings Detection ----------------
 function Test-ProblematicSettings {
     param(
@@ -453,13 +500,40 @@ function Test-ProblematicSettings {
 
     # Check for problematic settings that were removed in simplified implementation
     if ($Settings.PSObject.Properties['RecommendationLookBackDuration']) {
-        $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+        $value = $Settings.RecommendationLookBackDuration
+        # Only warn if it has actual data (not empty/null)
+        if ($value -and ($value.PSObject.Properties.Count -gt 0 -or $value -is [timespan])) {
+            $problematicSettings += "recommendationLookBackDuration (TimeSpan objects can cause serialization issues)"
+        }
     }
 
     if ($Settings.PSObject.Properties['RecommendationInsightSettings']) {
         $value = $Settings.RecommendationInsightSettings
-        if ($value) {
-            $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+        # Only warn if it has actual data (not empty array or array of empty objects)
+        if ($value -and $value.Count -gt 0) {
+            $hasNonEmptyItems = $false
+            foreach ($item in $value) {
+                # Check if item has properties beyond just AdditionalProperties
+                # or if AdditionalProperties itself has content
+                $propCount = $item.PSObject.Properties.Count
+                if ($propCount -eq 0) {
+                    # Truly empty object
+                    continue
+                } elseif ($propCount -eq 1 -and $item.PSObject.Properties.Name -contains 'AdditionalProperties') {
+                    # Only has AdditionalProperties - check if that's empty
+                    if ($item.AdditionalProperties -and $item.AdditionalProperties.Count -gt 0) {
+                        $hasNonEmptyItems = $true
+                        break
+                    }
+                } else {
+                    # Has other properties besides AdditionalProperties
+                    $hasNonEmptyItems = $true
+                    break
+                }
+            }
+            if ($hasNonEmptyItems) {
+                $problematicSettings += "recommendationInsightSettings (complex objects may cause validation errors)"
+            }
         }
     }
 
@@ -515,25 +589,32 @@ function Save-OutputLog {
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $outputFileName = "output-accessreview-$DefinitionId-$timestamp.json"
 
-        $outputData = @{
-            ScriptName         = $ScriptName
-            ScriptLastModified = $LastModifiedDate
-            Timestamp          = $timestamp
-            DefinitionId       = $DefinitionId
-            Success            = $IsSuccess
+        # Build output in specific order: script, invocation, originalDefinition, body
+        $outputData = [ordered]@{
+            Script     = [ordered]@{
+                ScriptName         = $ScriptName
+                ScriptLastModified = $LastModifiedDate
+            }
+            Invocation = [ordered]@{
+                DefinitionId = $DefinitionId
+                Timestamp    = $timestamp
+                Success      = $IsSuccess
+            }
         }
 
+        # Add problematic settings to invocation if detected
         if ($ProblematicSettings -and $ProblematicSettings.Count -gt 0) {
-            $outputData['ProblematicSettingsDetected'] = $ProblematicSettings
+            $outputData['Invocation']['ProblematicSettingsDetected'] = $ProblematicSettings
         }
 
+        # Add error details to invocation if not successful
         if (-not $IsSuccess) {
-            $outputData['ErrorMessage'] = $ErrorMessage
-            $outputData['ErrorDetails'] = $ErrorDetails
+            $outputData['Invocation']['ErrorMessage'] = $ErrorMessage
+            $outputData['Invocation']['ErrorDetails'] = $ErrorDetails
         }
 
         $outputData['OriginalDefinition'] = $Definition
-        $outputData['AttemptedBody'] = $Body
+        $outputData['Body'] = $Body
 
         $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
 
@@ -595,17 +676,29 @@ function processAccessReviewDefinition {
         # Unwrap and properly structure the scope based on its type
         $scopeHt = unwrapGraphObject $scopeData
 
-        # Ensure @odata.type is present (required for principalResourceMembershipsScope)
-        if (-not $scopeHt.'@odata.type') {
-            # If missing, try to determine from structure
-            if ($scopeHt.ContainsKey('principalScopes') -or $scopeHt.ContainsKey('resourceScopes')) {
-                $scopeHt.'@odata.type' = '#microsoft.graph.principalResourceMembershipsScope'
-            } elseif ($scopeHt.ContainsKey('query')) {
-                $scopeHt.'@odata.type' = '#microsoft.graph.accessReviewQueryScope'
+        # Check if scope is empty (common in some definitions)
+        if (-not $scopeHt -or $scopeHt.Keys.Count -eq 0 -or (-not $scopeHt.'@odata.type' -and -not $scopeHt.ContainsKey('query'))) {
+            Write-Host "Warning: Source definition has no valid scope. Scope will be omitted." -ForegroundColor Yellow
+            $scopeHt = $null
+        } else {
+            # Ensure @odata.type is present
+            if (-not $scopeHt.'@odata.type') {
+                # If missing, try to determine from structure
+                if ($scopeHt.ContainsKey('principalScopes') -or $scopeHt.ContainsKey('resourceScopes')) {
+                    $scopeHt.'@odata.type' = '#microsoft.graph.principalResourceMembershipsScope'
+                } elseif ($scopeHt.ContainsKey('query')) {
+                    $scopeHt.'@odata.type' = '#microsoft.graph.accessReviewQueryScope'
+                }
+            }
+
+            Write-Host "Using scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
+
+            # Always simplify scope to ensure tenant compatibility
+            $scopeHt = Simplify-Scope -ScopeHt $scopeHt
+            if ($scopeHt) {
+                Write-Host "Final scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
             }
         }
-
-        Write-Host "Using scope type: $($scopeHt.'@odata.type')" -ForegroundColor Green
 
         $reviewersArr = @(convertReviewerScopesToArray $old.Reviewers)
 
@@ -622,9 +715,13 @@ function processAccessReviewDefinition {
             displayName             = $old.DisplayName + $NewDisplayNameSuffix
             descriptionForAdmins    = if ($old.DescriptionForAdmins) { $old.DescriptionForAdmins } else { "Cloned from $DefinitionId on $(Get-Date -Format 'yyyy-MM-dd')" }
             descriptionForReviewers = if ($old.DescriptionForReviewers) { $old.DescriptionForReviewers } else { "Please review your access." }
-            scope                   = $scopeHt
             reviewers               = $reviewersArr
             settings                = $settingsHt
+        }
+
+        # Add scope only if it exists
+        if ($scopeHt) {
+            $body['scope'] = $scopeHt
         }
 
         # Add fallbackReviewers if they exist
@@ -673,7 +770,13 @@ function processAccessReviewDefinition {
                 Write-Host "`nError Details:" -ForegroundColor Red
                 Write-Host $errorDetails
             }
-
+            # Check for Custom Scoping Conditions error (tenant lacks advanced scope feature)
+            if ($errorDetails -match "Custom Scoping Conditions" -or $errorMsg -match "Custom Scoping Conditions") {
+                Write-Host "`n[INFO]" -ForegroundColor Yellow
+                Write-Host "This tenant does not support advanced scope features (principalResourceMembershipsScope)." -ForegroundColor Yellow
+                Write-Host "The script automatically simplifies scopes to basic accessReviewQueryScope for compatibility." -ForegroundColor Yellow
+                Write-Host "This error should not occur - please check the output log for details." -ForegroundColor Yellow
+            }
             Write-Host "`nDefinition ID: $DefinitionId" -ForegroundColor Cyan
 
             # Save output log (prompt only if suppressed)
