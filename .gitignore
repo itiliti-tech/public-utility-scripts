@@ -241,3 +241,7 @@ __azurite_db*__.json
 # ARM Templates
 *.parameters.json
 src/reopen-access-reviews/*-accessreview-*.json
+artifacts/output-accessreview-*.json
+artifacts/test-export-*.json
+artifacts/id-to-reopen.txt
+artifacts/quicktest.json
