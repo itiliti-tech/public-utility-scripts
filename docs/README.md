@@ -6,12 +6,14 @@
 
 - Location: `src/find-updated-files/find-updated-files.ps1`
 - Alternate implementation: `src/find-updated-files/find-updated-files.py`
+- Guide: `src/find-updated-files/README.md`
 - Purpose: Scans top-level folders under a root path and reports the most recent qualifying file update to CSV.
 
 ### Reopen Access Reviews
 
 - Location: `src/reopen-access-reviews/reopen-accessreview.ps1`
 - Input IDs file: `src/reopen-access-reviews/id-to-reopen.txt`
+- Guide: `src/reopen-access-reviews/README.md`
 - Purpose: Clones existing access review definitions by ID and creates one-time reopened reviews.
 
 ### Export Disabled Transport Rules
