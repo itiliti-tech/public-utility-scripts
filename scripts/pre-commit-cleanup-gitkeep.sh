@@ -59,7 +59,7 @@ while IFS= read -r file; do
 done < <(git diff --cached --name-only --diff-filter=ACM)
 
 # Directories that should always have .gitkeep if empty
-PRESERVED_DIRS=("src" "scripts" "docs" ".config", ".github")
+PRESERVED_DIRS=("src" "scripts" "docs" ".config" ".github")
 
 # Step 1: Remove unnecessary .gitkeep files from directories with content
 while IFS= read -r gitkeep_file; do
@@ -70,12 +70,12 @@ while IFS= read -r gitkeep_file; do
     # Skip if directory doesn't exist (was deleted)
     [ ! -d "$dir" ] && continue
 
-    # Count files in directory, excluding .gitkeep
-    file_count=$(find "$dir" -maxdepth 1 -type f ! -name '.gitkeep' 2>/dev/null | wc -l)
+    # Count entries in directory, excluding .gitkeep
+    entry_count=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' 2>/dev/null | wc -l)
 
-    # If directory has files besides .gitkeep, remove it
-    if [ "$file_count" -gt 0 ]; then
-        echo "Removing unnecessary .gitkeep: $gitkeep_file (directory has $file_count files)"
+    # If directory has entries besides .gitkeep, remove it
+    if [ "$entry_count" -gt 0 ]; then
+        echo "Removing unnecessary .gitkeep: $gitkeep_file (directory has $entry_count entries)"
         rm -f "$gitkeep_file"
 
         # Stage the removal
@@ -88,11 +88,11 @@ for dir in "${PRESERVED_DIRS[@]}"; do
     # Skip if directory doesn't exist
     [ ! -d "$dir" ] && continue
 
-    # Count files in directory (including hidden files, excluding . and ..)
-    file_count=$(find "$dir" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    # Count entries in directory, excluding .gitkeep
+    entry_count=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' 2>/dev/null | wc -l)
 
     # If directory is empty, add .gitkeep
-    if [ "$file_count" -eq 0 ]; then
+    if [ "$entry_count" -eq 0 ]; then
         gitkeep="$dir/.gitkeep"
         if [ ! -f "$gitkeep" ]; then
             echo "Adding .gitkeep to empty directory: $dir"

@@ -1,5 +1,25 @@
 # Documentation Index
 
+## Scripts
+
+### Find Updated Files
+
+- Location: `src/find-updated-files/find-updated-files.ps1`
+- Alternate implementation: `src/find-updated-files/find-updated-files.py`
+- Purpose: Scans top-level folders under a root path and reports the most recent qualifying file update to CSV.
+
+### Reopen Access Reviews
+
+- Location: `src/reopen-access-reviews/reopen-accessreview.ps1`
+- Input IDs file: `src/reopen-access-reviews/id-to-reopen.txt`
+- Purpose: Clones existing access review definitions by ID and creates one-time reopened reviews.
+
+### Export Disabled Transport Rules
+
+- Location: `src/export-disabled-transport-rules/Export-DisabledTransportRules.ps1`
+- Guide: `src/export-disabled-transport-rules/README.md`
+- Purpose: Exports disabled Exchange transport rules with full details and a flattened summary.
+
 ## Git Hooks
 
 ### Pre-commit Hook
