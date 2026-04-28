@@ -1,55 +1,4 @@
 <#
-Clone an existing Access Review schedule definition by ID and create a NEW one-time definition
-that starts today (or StartDate) and stays open for 30 days (or InstanceDurationInDays).
-
-Automatically simplifies complex principalResourceMembershipsScope to basic accessReviewQueryScope
-for maximum tenant compatibility. Supports both simple and complex source definitions.
-
-Requires:
-- Microsoft.Graph.Identity.Governance
-- AccessReview.ReadWrite.All
-
-Last Modified: 2026-01-28 16:38
-Fixed: Strip query complexity (transitiveMembers/type filters) to avoid "Custom Scoping Conditions" error
-#>
-
-param(
-    [Parameter(Mandatory = $false, Position = 0)]
-    [string] $OldDefinitionId,
-
-    [Parameter(Mandatory = $false)]
-    [string] $FromFile,
-
-    [Parameter(Mandatory = $false)]
-    [datetime] $StartDate = (Get-Date),   # default: today
-
-    [Parameter(Mandatory = $false)]
-    [int] $InstanceDurationInDays = 30,    # default: 30 days open
-
-    [Parameter(Mandatory = $false)]
-    [string] $NewDisplayNameSuffix = " - Reopened (One-time)",
-
-    [Parameter(Mandatory = $false)]
-    [switch] $WhatIf,
-
-    [Parameter(Mandatory = $false)]
-    [switch] $DumpDefinition,
-
-    [Parameter(Mandatory = $false)]
-    [switch] $SuppressOutputLogs,
-
-    [Parameter(Mandatory = $false)]
-    [switch] $DisplayBody
-)
-
-$ErrorActionPreference = "Stop"
-
-# ---------------- Script Metadata ----------------
-$ScriptName = Split-Path -Leaf $PSCommandPath
-$LastModifiedDate = "Unknown"
-
-# Extract Last Modified date from header
-<#
 .SYNOPSIS
     Clone access review definitions and create one-time reopened reviews.
 
@@ -96,16 +45,52 @@ $LastModifiedDate = "Unknown"
 .NOTES
     Required module: Microsoft.Graph.Identity.Governance
     Required Graph scopes: AccessReview.Read.All or AccessReview.ReadWrite.All
+    PowerShell 7.x required code: none
+    Compatibility baseline: PowerShell 5.1+
     Last Modified: 2026-01-28 16:38
     Fixed: Strip query complexity (transitiveMembers/type filters) to avoid "Custom Scoping Conditions" error
 #>
 
 [CmdletBinding()]
-Write-Host ""
+param(
+    [Parameter(Mandatory = $false, Position = 0)]
+    [string] $OldDefinitionId,
 
-# Build list of IDs to process
+    [Parameter(Mandatory = $false)]
+    [string] $FromFile,
+
+    [Parameter(Mandatory = $false)]
+    [datetime] $StartDate = (Get-Date),   # default: today
+
+    [Parameter(Mandatory = $false)]
+    [int] $InstanceDurationInDays = 30,    # default: 30 days open
+
+    [Parameter(Mandatory = $false)]
+    [string] $NewDisplayNameSuffix = " - Reopened (One-time)",
+
+    [Parameter(Mandatory = $false)]
+    [switch] $WhatIf,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DumpDefinition,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $SuppressOutputLogs,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $DisplayBody
+)
+
 Set-StrictMode -Version Latest
-$DefinitionIds = @()
+$ErrorActionPreference = "Stop"
+
+function Assert-MinimumPowerShellVersion {
+    param([Parameter(Mandatory = $true)][Version]$MinimumVersion)
+
+    if ($PSVersionTable.PSVersion -lt $MinimumVersion) {
+        throw "PowerShell $MinimumVersion or later is required. Current version: $($PSVersionTable.PSVersion)."
+    }
+}
 
 function Assert-RequiredModule {
     param([Parameter(Mandatory = $true)][string]$Name)
@@ -130,6 +115,32 @@ function Connect-GraphIfNeeded {
         Connect-MgGraph -Scopes $Scopes
     }
 }
+
+Assert-MinimumPowerShellVersion -MinimumVersion ([Version]"5.1")
+
+# ---------------- Script Metadata ----------------
+$ScriptName = Split-Path -Leaf $PSCommandPath
+$LastModifiedDate = "Unknown"
+
+# Extract Last Modified date from header
+try {
+    $headerContent = Get-Content $PSCommandPath -First 30 -ErrorAction SilentlyContinue
+    $lastModifiedLine = $headerContent | Where-Object { $_ -match 'Last Modified:\s*(.+)' } | Select-Object -First 1
+    if ($lastModifiedLine -and $Matches[1]) {
+        $LastModifiedDate = $Matches[1].Trim()
+    }
+} catch {
+    # If we can't read the file, just use Unknown
+}
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Script: $ScriptName" -ForegroundColor Cyan
+Write-Host "Last Modified: $LastModifiedDate" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Build list of IDs to process
+$DefinitionIds = @()
 if ($FromFile) {
     if (-not (Test-Path $FromFile)) {
         throw "File not found: $FromFile"

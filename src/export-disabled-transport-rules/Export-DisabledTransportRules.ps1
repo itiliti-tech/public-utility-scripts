@@ -32,6 +32,7 @@
 .NOTES
   - Exchange Online: requires ExchangeOnlineManagement module and appropriate permissions.
   - Exchange On-Prem: run in Exchange Management Shell (EMS) or load snap-in.
+    - PowerShell 7.x required code: none.
 #>
 
 [CmdletBinding()]

@@ -32,6 +32,7 @@
 
 .NOTES
     Compatibility: PowerShell 5.0+
+    PowerShell 7.x required code: none
     Modified: auto-updated by pre-commit hook
 #>
 
@@ -51,19 +52,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-
-function Assert-RequiredCommand {
-    param([Parameter(Mandatory = $true)][string]$Name)
-
-    if (-not (Get-Command -Name $Name -ErrorAction SilentlyContinue)) {
-        throw "Required command '$Name' is not available in this session."
-    }
-}
-
-Assert-RequiredCommand -Name "Get-ChildItem"
-Assert-RequiredCommand -Name "Set-Content"
-Assert-RequiredCommand -Name "Add-Content"
-Assert-RequiredCommand -Name "Test-Path"
 
 # Prompt for input if parameters not provided
 if ([string]::IsNullOrWhiteSpace($RootDirectory)) {
