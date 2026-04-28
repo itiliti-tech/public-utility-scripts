@@ -1,6 +1,29 @@
 <#
 .SYNOPSIS
-  Exports all disabled Exchange transport rules with full settings/actions/conditions/exceptions.
+    Exports disabled Exchange transport rules with full and summary outputs.
+
+.DESCRIPTION
+    Retrieves transport rules, filters for disabled rules, and exports two files:
+    a full JSON object dump and a flattened CSV summary.
+
+.PARAMETER OutputFolder
+    Output directory for exported files. Defaults to a timestamped folder in
+    the current working directory.
+
+.PARAMETER ExchangeOnline
+    When provided, the script connects to Exchange Online before querying rules.
+
+.PARAMETER TenantUPN
+    Optional UPN for Exchange Online sign-in.
+
+.EXAMPLE
+    .\Export-DisabledTransportRules.ps1 -ExchangeOnline
+
+.EXAMPLE
+    .\Export-DisabledTransportRules.ps1 -ExchangeOnline -TenantUPN admin@contoso.com
+
+.EXAMPLE
+    .\Export-DisabledTransportRules.ps1 -OutputFolder .\out\transport-rules
 
 .OUTPUTS
   - DisabledTransportRules_FULL.json  (full fidelity)
@@ -26,14 +49,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Initialize-Folder {
+function New-OutputFolder {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
     }
 }
 
-function Connect-EXOIfNeeded {
+function Assert-TransportRuleCommandAvailable {
+    if (-not (Get-Command -Name Get-TransportRule -ErrorAction SilentlyContinue)) {
+        throw "Get-TransportRule is not available. For Exchange Online use -ExchangeOnline. For on-prem, run in Exchange Management Shell or load Exchange cmdlets."
+    }
+}
+
+function Connect-ExchangeOnlineIfNeeded {
     param([switch]$DoConnect, [string]$UPN)
 
     if (-not $DoConnect) { return }
@@ -89,8 +118,9 @@ function Test-RuleIsDisabled {
     return $false
 }
 
-Initialize-Folder -Path $OutputFolder
-Connect-EXOIfNeeded -DoConnect:$ExchangeOnline -UPN $TenantUPN
+New-OutputFolder -Path $OutputFolder
+Connect-ExchangeOnlineIfNeeded -DoConnect:$ExchangeOnline -UPN $TenantUPN
+Assert-TransportRuleCommandAvailable
 
 Write-Host "Getting disabled transport rules..." -ForegroundColor Cyan
 

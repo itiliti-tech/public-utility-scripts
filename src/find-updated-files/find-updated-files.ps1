@@ -7,6 +7,9 @@
     and outputs the results to a CSV file. This is useful for tracking which project
     folders have been updated since a specified date.
 
+    This script uses built-in PowerShell cmdlets only and does not require
+    external modules.
+
 .PARAMETER RootDirectory
     The root directory to start scanning from. If not provided, will prompt for input.
 
@@ -45,6 +48,22 @@ param(
         ".DS_Store"
     )
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Assert-RequiredCommand {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if (-not (Get-Command -Name $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' is not available in this session."
+    }
+}
+
+Assert-RequiredCommand -Name "Get-ChildItem"
+Assert-RequiredCommand -Name "Set-Content"
+Assert-RequiredCommand -Name "Add-Content"
+Assert-RequiredCommand -Name "Test-Path"
 
 # Prompt for input if parameters not provided
 if ([string]::IsNullOrWhiteSpace($RootDirectory)) {

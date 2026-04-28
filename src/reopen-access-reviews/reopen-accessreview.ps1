@@ -49,24 +49,87 @@ $ScriptName = Split-Path -Leaf $PSCommandPath
 $LastModifiedDate = "Unknown"
 
 # Extract Last Modified date from header
-try {
-    $headerContent = Get-Content $PSCommandPath -First 30 -ErrorAction SilentlyContinue
-    $lastModifiedLine = $headerContent | Where-Object { $_ -match 'Last Modified:\s*(.+)' } | Select-Object -First 1
-    if ($lastModifiedLine -and $Matches[1]) {
-        $LastModifiedDate = $Matches[1].Trim()
-    }
-} catch {
-    # If we can't read the file, just use Unknown
-}
+<#
+.SYNOPSIS
+    Clone access review definitions and create one-time reopened reviews.
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Script: $ScriptName" -ForegroundColor Cyan
-Write-Host "Last Modified: $LastModifiedDate" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
+.DESCRIPTION
+    Reads one or more source access review schedule definition IDs, builds a compatible
+    payload, and creates a new one-time access review definition per source ID.
+
+    The script simplifies advanced scope constructs when needed for tenant compatibility
+    and includes optional diagnostics output for troubleshooting.
+
+.PARAMETER OldDefinitionId
+    Single source definition ID to clone.
+
+.PARAMETER FromFile
+    Path to a file containing source definition IDs, one per line.
+
+.PARAMETER StartDate
+    Start date for the new one-time review.
+
+.PARAMETER InstanceDurationInDays
+    Review duration in days for each created definition.
+
+.PARAMETER NewDisplayNameSuffix
+    Suffix appended to each created review display name.
+
+.PARAMETER WhatIf
+    Shows what would be created without sending create requests.
+
+.PARAMETER DumpDefinition
+    Dumps source definition JSON and exits without creation.
+
+.PARAMETER SuppressOutputLogs
+    Suppresses automatic output log files unless an error prompts for one.
+
+.PARAMETER DisplayBody
+    Displays outbound Graph payload JSON before create requests.
+
+.EXAMPLE
+    .\reopen-accessreview.ps1 -OldDefinitionId "<definition-id>"
+
+.EXAMPLE
+    .\reopen-accessreview.ps1 -FromFile .\id-to-reopen.txt -WhatIf
+
+.NOTES
+    Required module: Microsoft.Graph.Identity.Governance
+    Required Graph scopes: AccessReview.Read.All or AccessReview.ReadWrite.All
+    Last Modified: 2026-01-28 16:38
+    Fixed: Strip query complexity (transitiveMembers/type filters) to avoid "Custom Scoping Conditions" error
+#>
+
+[CmdletBinding()]
 Write-Host ""
 
 # Build list of IDs to process
+Set-StrictMode -Version Latest
 $DefinitionIds = @()
+
+function Assert-RequiredModule {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if (-not (Get-Module -ListAvailable -Name $Name)) {
+        throw "Required module '$Name' is not installed. Install with: Install-Module $Name -Scope CurrentUser"
+    }
+}
+
+function Assert-RequiredGraphCommand {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if (-not (Get-Command -Name $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' is not available after importing Microsoft Graph modules."
+    }
+}
+
+function Connect-GraphIfNeeded {
+    param([Parameter(Mandatory = $true)][string[]]$Scopes)
+
+    if (-not (Get-MgContext)) {
+        Connect-MgGraph -Scopes $Scopes
+    }
+}
 if ($FromFile) {
     if (-not (Test-Path $FromFile)) {
         throw "File not found: $FromFile"
@@ -83,7 +146,7 @@ if ($FromFile) {
 }
 
 # ---------------- Utilities ----------------
-function toIso8601Duration {
+function ConvertTo-Iso8601Duration {
     param($duration)
     if ($duration -is [string] -and $duration -match '^[Pp]') { return $duration }
 
@@ -108,7 +171,7 @@ function toIso8601Duration {
     return "P$($datePart)"
 }
 
-function removeNullsRecursively {
+function Remove-NullValuesRecursively {
     param([Parameter(Mandatory)]$obj)
 
     if ($obj -is [System.Collections.IDictionary]) {
@@ -118,7 +181,7 @@ function removeNullsRecursively {
                 $obj.Remove($k) | Out-Null
                 continue
             }
-            removeNullsRecursively -obj $v
+            Remove-NullValuesRecursively -obj $v
         }
         return
     }
@@ -126,14 +189,14 @@ function removeNullsRecursively {
     if ($obj -is [System.Collections.IList]) {
         for ($i = 0; $i -lt $obj.Count; $i++) {
             $v = $obj[$i]
-            if ($null -ne $v) { removeNullsRecursively -obj $v }
+            if ($null -ne $v) { Remove-NullValuesRecursively -obj $v }
         }
         return
     }
 }
 
 # Replace only a leading /beta/ with /v1.0/
-function normalizeGraphPathVersion {
+function ConvertTo-GraphPathVersion {
     param([string]$path)
     if (-not $path) { return $path }
     if ($path -match '^/beta/') { return ($path -replace '^/beta/', '/v1.0/') }
@@ -141,28 +204,28 @@ function normalizeGraphPathVersion {
 }
 
 # ---------------- Deep coercion ----------------
-function coerceGraphValue {
+function ConvertTo-GraphValue {
     param($v)
 
     if ($null -eq $v) { return $null }
 
     if ($v -is [System.Collections.IDictionary]) {
         $h = @{}
-        foreach ($k in $v.Keys) { $h["$k"] = coerceGraphValue $v[$k] }
+        foreach ($k in $v.Keys) { $h["$k"] = ConvertTo-GraphValue $v[$k] }
         return $h
     }
 
     if (($v -is [System.Collections.IEnumerable]) -and -not ($v -is [string])) {
-        if ($v -is [System.Collections.IDictionary]) { return (coerceGraphValue $v) }
+        if ($v -is [System.Collections.IDictionary]) { return (ConvertTo-GraphValue $v) }
         $arr = @()
-        foreach ($x in $v) { $arr += (coerceGraphValue $x) }
+        foreach ($x in $v) { $arr += (ConvertTo-GraphValue $x) }
         return $arr
     }
 
     return $v
 }
 
-function normalizeCommonGraphKeys {
+function ConvertTo-GraphCommonKeys {
     param($ht)
     if (-not ($ht -is [System.Collections.IDictionary])) { return $ht }
 
@@ -181,15 +244,15 @@ function normalizeCommonGraphKeys {
     return $ht
 }
 
-function normalizeGraphStructureRecursively {
+function ConvertTo-GraphStructureRecursively {
     param($obj)
 
     if ($null -eq $obj) { return $null }
 
     if ($obj -is [System.Collections.IDictionary]) {
-        $obj = normalizeCommonGraphKeys $obj
+        $obj = ConvertTo-GraphCommonKeys $obj
         foreach ($k in @($obj.Keys)) {
-            $obj[$k] = normalizeGraphStructureRecursively $obj[$k]
+            $obj[$k] = ConvertTo-GraphStructureRecursively $obj[$k]
 
             # Ensure certain properties are arrays
             if ($k -in @('principalScopes', 'resourceScopes', 'fallbackReviewers')) {
@@ -200,7 +263,7 @@ function normalizeGraphStructureRecursively {
         }
         # Normalize query paths
         if ($obj.ContainsKey('query') -and $obj['query']) {
-            $obj['query'] = normalizeGraphPathVersion $obj['query']
+            $obj['query'] = ConvertTo-GraphPathVersion $obj['query']
         }
         return $obj
     }
@@ -208,7 +271,7 @@ function normalizeGraphStructureRecursively {
     if ($obj -is [System.Collections.IList]) {
         $arr = @()
         foreach ($item in $obj) {
-            $arr += normalizeGraphStructureRecursively $item
+            $arr += ConvertTo-GraphStructureRecursively $item
         }
         return $arr
     }
@@ -217,7 +280,7 @@ function normalizeGraphStructureRecursively {
 }
 
 # If it looks like a "dictionary dump object" (Keys/Values/SyncRoot/etc), use SyncRoot.
-function unwrapDictDumpIfPresent {
+function Get-UnwrappedDictionaryDump {
     param($obj)
 
     if ($null -eq $obj) { return $null }
@@ -236,40 +299,40 @@ function unwrapDictDumpIfPresent {
     return $obj
 }
 
-function unwrapGraphObject {
+function ConvertTo-GraphHashtable {
     param($sdkObj)
 
     if (-not $sdkObj) { return $null }
 
     # If already a dictionary/list, deep-coerce
     if ($sdkObj -is [System.Collections.IDictionary] -or (($sdkObj -is [System.Collections.IEnumerable]) -and -not ($sdkObj -is [string]))) {
-        $coerced = coerceGraphValue $sdkObj
+        $coerced = ConvertTo-GraphValue $sdkObj
         if ($coerced -is [hashtable]) {
-            $coerced = unwrapDictDumpIfPresent $coerced
-            return normalizeGraphStructureRecursively $coerced
+            $coerced = Get-UnwrappedDictionaryDump $coerced
+            return ConvertTo-GraphStructureRecursively $coerced
         }
-        return normalizeGraphStructureRecursively $coerced
+        return ConvertTo-GraphStructureRecursively $coerced
     }
 
     # Merge properties + AdditionalProperties
     $h = @{}
     $props = $sdkObj.PSObject.Properties | Where-Object { $_.Name -ne 'AdditionalProperties' }
     foreach ($p in $props) {
-        $h[$p.Name] = coerceGraphValue $p.Value
+        $h[$p.Name] = ConvertTo-GraphValue $p.Value
     }
     if ($sdkObj.PSObject.Properties['AdditionalProperties']) {
         foreach ($k in $sdkObj.AdditionalProperties.Keys) {
-            $h[$k] = coerceGraphValue $sdkObj.AdditionalProperties[$k]
+            $h[$k] = ConvertTo-GraphValue $sdkObj.AdditionalProperties[$k]
         }
     }
-    return normalizeGraphStructureRecursively $h
+    return ConvertTo-GraphStructureRecursively $h
 }
 
-function normalizeQueryScopeItem {
+function ConvertTo-QueryScopeItem {
     param($item)
     if (-not $item) { return $null }
 
-    $unwrapped = unwrapGraphObject $item
+    $unwrapped = ConvertTo-GraphHashtable $item
     if ($unwrapped -isnot [System.Collections.IDictionary]) { return $null }
 
     # Build a clean scope with normalized keys
@@ -295,13 +358,13 @@ function normalizeQueryScopeItem {
     return $normalized
 }
 
-function normalizeQueryScopeArray {
+function ConvertTo-QueryScopeArray {
     param($items)
     if (-not $items) { return @() }
 
     $result = @()
     foreach ($item in @($items)) {
-        $normalized = normalizeQueryScopeItem $item
+        $normalized = ConvertTo-QueryScopeItem $item
         if ($normalized) {
             $result += $normalized
         }
@@ -309,13 +372,13 @@ function normalizeQueryScopeArray {
     return $result
 }
 
-function convertReviewerScopesToArray {
+function ConvertTo-ReviewerScopeArray {
     param($items)
     if (-not $items) { return @() }
 
     $out = @()
     foreach ($i in @($items)) {
-        $h = unwrapGraphObject $i
+        $h = ConvertTo-GraphHashtable $i
         if (-not $h) { continue }
         if ($h -isnot [System.Collections.IDictionary]) { continue }
 
@@ -340,7 +403,7 @@ function convertReviewerScopesToArray {
     return $out
 }
 
-function convertAdditionalRecipientsToArray {
+function ConvertTo-AdditionalRecipientArray {
     param($items)
     if (-not $items) { return @() }
 
@@ -348,7 +411,7 @@ function convertAdditionalRecipientsToArray {
     foreach ($i in @($items)) {
         if (-not $i) { continue }
 
-        $raw = unwrapGraphObject $i
+        $raw = ConvertTo-GraphHashtable $i
         if (-not $raw) { continue }
         if ($raw -isnot [System.Collections.IDictionary]) { continue }
 
@@ -361,7 +424,7 @@ function convertAdditionalRecipientsToArray {
             if ($raw.ContainsKey($cand)) { $scope = $raw[$cand]; break }
         }
 
-        $scopeH = normalizeQueryScopeItem $scope
+        $scopeH = ConvertTo-QueryScopeItem $scope
         if (-not $scopeH -or ($scopeH -is [System.Collections.IDictionary] -and -not $scopeH.ContainsKey('query'))) { continue }
 
         $scopeH['@odata.type'] = '#microsoft.graph.accessReviewNotificationRecipientQueryScope'
@@ -377,7 +440,7 @@ function convertAdditionalRecipientsToArray {
 }
 
 # One-time recurrence starting StartDate with 1 occurrence
-function buildOneTimeRecurrence {
+function New-OneTimeRecurrence {
     param([datetime]$start)
 
     $startStr = $start.ToString('yyyy-MM-dd')
@@ -396,7 +459,7 @@ function buildOneTimeRecurrence {
 }
 
 # Build settings object with all required fields
-function buildSettingsObject {
+function New-AccessReviewSettingsObject {
     param(
         [object]$oldSettings,
         [datetime]$StartDate,
@@ -424,7 +487,7 @@ function buildSettingsObject {
 
         # Scheduling - set by us for one-time review
         'instanceDurationInDays'          = $InstanceDurationInDays
-        'recurrence'                      = buildOneTimeRecurrence $StartDate
+        'recurrence'                      = New-OneTimeRecurrence $StartDate
     }
 
     # Handle recommendationLookBackDuration - extract days and create ISO 8601 duration
@@ -432,7 +495,7 @@ function buildSettingsObject {
         $lookback = $oldSettings.RecommendationLookBackDuration
         if ($lookback) {
             # Try to convert to ISO 8601 duration string using just the days
-            $durationStr = toIso8601Duration $lookback
+            $durationStr = ConvertTo-Iso8601Duration $lookback
             if ($durationStr) {
                 $settingsHt['recommendationLookBackDuration'] = $durationStr
                 Write-Host "  Including recommendationLookBackDuration: $durationStr" -ForegroundColor Cyan
@@ -444,7 +507,7 @@ function buildSettingsObject {
 
     # Copy applyActions if present AND non-empty (actions to apply on denied guest users)
     if ($oldSettings.PSObject.Properties['ApplyActions']) {
-        $actions = unwrapGraphObject $oldSettings.ApplyActions
+        $actions = ConvertTo-GraphHashtable $oldSettings.ApplyActions
         # Filter out empty objects that cause validation errors
         $validActions = @($actions | Where-Object {
                 $_ -and ($_ -is [System.Collections.IDictionary]) -and $_.Keys.Count -gt 0
@@ -471,7 +534,7 @@ function ConvertTo-SimpleScope {
 
     # Strip out complex filtering from queries (transitiveMembers, microsoft.graph.user, etc.)
     # Some tenants don't support these "Custom Scoping Conditions"
-    function Strip-QueryComplexity {
+    function ConvertTo-SimplifiedScopeQuery {
         param([string]$query)
 
         if (-not $query) { return $query }
@@ -493,7 +556,7 @@ function ConvertTo-SimpleScope {
     # If it's already a simple scope, strip complexity and return
     if ($ScopeHt.'@odata.type' -eq '#microsoft.graph.accessReviewQueryScope') {
         if ($ScopeHt.ContainsKey('query')) {
-            $ScopeHt['query'] = Strip-QueryComplexity -query $ScopeHt['query']
+            $ScopeHt['query'] = ConvertTo-SimplifiedScopeQuery -query $ScopeHt['query']
         }
         return $ScopeHt
     }
@@ -507,7 +570,7 @@ function ConvertTo-SimpleScope {
             $firstResource = $ScopeHt['resourceScopes'][0]
 
             $originalQuery = $firstResource['query']
-            $simplifiedQuery = Strip-QueryComplexity -query $originalQuery
+            $simplifiedQuery = ConvertTo-SimplifiedScopeQuery -query $originalQuery
 
             $simplifiedScope = @{
                 '@odata.type' = '#microsoft.graph.accessReviewQueryScope'
@@ -664,7 +727,7 @@ function Export-OutputLog {
         }
 
         # Properly unwrap the Graph SDK object to include all AdditionalProperties
-        $outputData['OriginalDefinition'] = unwrapGraphObject $Definition
+        $outputData['OriginalDefinition'] = ConvertTo-GraphHashtable $Definition
         $outputData['Body'] = $Body
 
         $outputData | ConvertTo-Json -Depth 100 | Out-File $outputFileName -Encoding UTF8
@@ -678,7 +741,7 @@ function Export-OutputLog {
 }
 
 # ---------------- Main processing function ----------------
-function processAccessReviewDefinition {
+function Invoke-AccessReviewDefinitionProcess {
     param(
         [string]$DefinitionId,
         [datetime]$StartDate,
@@ -725,7 +788,7 @@ function processAccessReviewDefinition {
         Write-Host "Scope @odata.type: $(if ($scopeData.'@odata.type') { $scopeData.'@odata.type' } else { 'N/A' })" -ForegroundColor Cyan
 
         # Unwrap and properly structure the scope based on its type
-        $scopeHt = unwrapGraphObject $scopeData
+        $scopeHt = ConvertTo-GraphHashtable $scopeData
 
         # Check if scope is empty (common in some definitions)
         if (-not $scopeHt -or $scopeHt.Keys.Count -eq 0 -or (-not $scopeHt.'@odata.type' -and -not $scopeHt.ContainsKey('query'))) {
@@ -751,14 +814,14 @@ function processAccessReviewDefinition {
             }
         }
 
-        $reviewersArr = @(convertReviewerScopesToArray $old.Reviewers)
+        $reviewersArr = @(ConvertTo-ReviewerScopeArray $old.Reviewers)
 
         if ($reviewersArr.Count -eq 0) {
             throw "No valid reviewers found after conversion (Graph requires reviewers with query/queryType)."
         }
 
         # Build settings with proper structure (includes recurrence and instanceDurationInDays)
-        $settingsHt = buildSettingsObject -oldSettings $old.Settings -StartDate $StartDate -InstanceDurationInDays $InstanceDurationInDays
+        $settingsHt = New-AccessReviewSettingsObject -oldSettings $old.Settings -StartDate $StartDate -InstanceDurationInDays $InstanceDurationInDays
 
         # Build the body for the new definition
         # Based on MS documentation: recurrence and instanceDurationInDays go INSIDE settings
@@ -776,12 +839,12 @@ function processAccessReviewDefinition {
         }
 
         # Add fallbackReviewers if they exist
-        $fallbackReviewersArr = @(convertReviewerScopesToArray $old.FallbackReviewers)
+        $fallbackReviewersArr = @(ConvertTo-ReviewerScopeArray $old.FallbackReviewers)
         if ($fallbackReviewersArr.Count -gt 0) {
             $body['fallbackReviewers'] = $fallbackReviewersArr
         }
 
-        removeNullsRecursively -obj $body
+        Remove-NullValuesRecursively -obj $body
 
         # Display body if requested
         if ($ShowBody) {
@@ -878,13 +941,16 @@ function processAccessReviewDefinition {
 }
 
 # ---------------- Connect & load ----------------
+Assert-RequiredModule -Name "Microsoft.Graph.Identity.Governance"
 Import-Module Microsoft.Graph.Identity.Governance -ErrorAction Stop
+Assert-RequiredGraphCommand -Name "Get-MgContext"
+Assert-RequiredGraphCommand -Name "Connect-MgGraph"
+Assert-RequiredGraphCommand -Name "Get-MgIdentityGovernanceAccessReviewDefinition"
+Assert-RequiredGraphCommand -Name "New-MgIdentityGovernanceAccessReviewDefinition"
 
 # If DumpDefinition mode, connect and dump, then exit
 if ($DumpDefinition.IsPresent) {
-    if (-not (Get-MgContext)) {
-        Connect-MgGraph -Scopes "AccessReview.Read.All"
-    }
+    Connect-GraphIfNeeded -Scopes @("AccessReview.Read.All")
 
     foreach ($defId in $DefinitionIds) {
         Write-Host "`n========================================" -ForegroundColor Cyan
@@ -904,17 +970,17 @@ if ($DumpDefinition.IsPresent) {
                 LastModifiedDateTime             = if ($definition.LastModifiedDateTime) { $definition.LastModifiedDateTime.ToString('o') } else { $null }
                 Status                           = $definition.Status
                 InstanceDurationInDays           = $definition.InstanceDurationInDays
-                Scope                            = unwrapGraphObject $definition.Scope
-                Reviewers                        = @(convertReviewerScopesToArray $definition.Reviewers)
-                FallbackReviewers                = @(convertReviewerScopesToArray $definition.FallbackReviewers)
-                Settings                         = unwrapGraphObject $definition.Settings
-                InstanceEnumerationScope         = unwrapGraphObject $definition.InstanceEnumerationScope
-                Recurrence                       = unwrapGraphObject $definition.Recurrence
-                AdditionalNotificationRecipients = @(convertAdditionalRecipientsToArray $definition.AdditionalNotificationRecipients)
+                Scope                            = ConvertTo-GraphHashtable $definition.Scope
+                Reviewers                        = @(ConvertTo-ReviewerScopeArray $definition.Reviewers)
+                FallbackReviewers                = @(ConvertTo-ReviewerScopeArray $definition.FallbackReviewers)
+                Settings                         = ConvertTo-GraphHashtable $definition.Settings
+                InstanceEnumerationScope         = ConvertTo-GraphHashtable $definition.InstanceEnumerationScope
+                Recurrence                       = ConvertTo-GraphHashtable $definition.Recurrence
+                AdditionalNotificationRecipients = @(ConvertTo-AdditionalRecipientArray $definition.AdditionalNotificationRecipients)
             }
 
             # Remove null values
-            removeNullsRecursively -obj $convertedDef
+            Remove-NullValuesRecursively -obj $convertedDef
 
             # Convert to JSON with full depth for complete text representation
             $jsonOutput = $convertedDef | ConvertTo-Json -Depth 100
@@ -934,15 +1000,13 @@ if ($DumpDefinition.IsPresent) {
 }
 
 # Connect for normal processing
-if (-not (Get-MgContext)) {
-    Connect-MgGraph -Scopes "AccessReview.ReadWrite.All"
-}
+Connect-GraphIfNeeded -Scopes @("AccessReview.ReadWrite.All")
 
 # Process each definition ID
 
 $results = @()
 foreach ($defId in $DefinitionIds) {
-    $result = processAccessReviewDefinition `
+    $result = Invoke-AccessReviewDefinitionProcess `
         -DefinitionId $defId `
         -StartDate $StartDate `
         -InstanceDurationInDays $InstanceDurationInDays `
@@ -963,3 +1027,4 @@ if ($results.Count -gt 0) {
 } elseif ($WhatIf.IsPresent) {
     Write-Host "`n[WHATIF] No definitions were created (WhatIf mode)" -ForegroundColor Yellow
 }
+
